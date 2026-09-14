@@ -146,6 +146,24 @@ class SidecarConfigurationTest
         assertThat(operationalJob.localJobCoordinationDelay()).isEqualTo(SecondBoundConfiguration.parse("90s"));
         assertThat(operationalJob.nodeExecutionTimeout()).isEqualTo(SecondBoundConfiguration.parse("20m"));
         assertThat(operationalJob.durableTrackingEnabled()).isTrue();
+
+        RollingRestartConfiguration rollingRestart = operationalJob.rollingRestartConfiguration();
+        assertThat(rollingRestart).isNotNull();
+        assertThat(rollingRestart.enabled()).isTrue();
+        assertThat(rollingRestart.cassandraHealthTimeout()).isEqualTo(SecondBoundConfiguration.parse("45s"));
+        assertThat(rollingRestart.nodeStateTransitionTimeout()).isEqualTo(SecondBoundConfiguration.parse("300s"));
+        assertThat(rollingRestart.nodeRestartRetryAttempts()).isEqualTo(5);
+        assertThat(rollingRestart.waitBetweenExecutionGroups()).isEqualTo(SecondBoundConfiguration.parse("120s"));
+    }
+
+    @Test
+    void testInvalidRollingRestartConfiguration()
+    {
+        Path yamlPath = yaml("config/sidecar_operational_job_invalid.yaml");
+        assertThatExceptionOfType(JsonMappingException.class)
+        .isThrownBy(() -> SidecarConfigurationImpl.readYamlConfiguration(yamlPath))
+        .withRootCauseInstanceOf(IllegalArgumentException.class)
+        .withMessageContaining("node_restart_retry_attempts must not be negative");
     }
 
     @Test

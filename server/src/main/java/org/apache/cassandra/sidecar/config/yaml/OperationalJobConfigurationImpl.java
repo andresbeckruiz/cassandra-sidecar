@@ -22,6 +22,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import org.apache.cassandra.sidecar.common.DataObjectBuilder;
 import org.apache.cassandra.sidecar.common.server.utils.SecondBoundConfiguration;
 import org.apache.cassandra.sidecar.config.OperationalJobConfiguration;
+import org.apache.cassandra.sidecar.config.RollingRestartConfiguration;
 
 /**
  * Configuration for operational jobs managed by Sidecar
@@ -40,6 +41,7 @@ public class OperationalJobConfigurationImpl implements OperationalJobConfigurat
     protected SecondBoundConfiguration localJobCoordinationDelay;
     protected SecondBoundConfiguration nodeExecutionTimeout;
     protected boolean durableTrackingEnabled;
+    protected RollingRestartConfigurationImpl rollingRestartConfiguration;
 
     public OperationalJobConfigurationImpl()
     {
@@ -53,6 +55,7 @@ public class OperationalJobConfigurationImpl implements OperationalJobConfigurat
         this.localJobCoordinationDelay = builder.localJobCoordinationDelay;
         this.nodeExecutionTimeout = builder.nodeExecutionTimeout;
         this.durableTrackingEnabled = builder.durableTrackingEnabled;
+        this.rollingRestartConfiguration = builder.rollingRestartConfiguration;
         validate();
     }
 
@@ -129,6 +132,19 @@ public class OperationalJobConfigurationImpl implements OperationalJobConfigurat
         this.durableTrackingEnabled = durableTrackingEnabled;
     }
 
+    @Override
+    @JsonProperty(value = "rolling_restart")
+    public RollingRestartConfiguration rollingRestartConfiguration()
+    {
+        return rollingRestartConfiguration;
+    }
+
+    @JsonProperty(value = "rolling_restart")
+    public void setRollingRestartConfiguration(RollingRestartConfigurationImpl rollingRestartConfiguration)
+    {
+        this.rollingRestartConfiguration = rollingRestartConfiguration;
+    }
+
     public static Builder builder()
     {
         return new Builder();
@@ -144,6 +160,7 @@ public class OperationalJobConfigurationImpl implements OperationalJobConfigurat
         private SecondBoundConfiguration localJobCoordinationDelay = DEFAULT_LOCAL_JOB_COORDINATION_DELAY;
         private SecondBoundConfiguration nodeExecutionTimeout = DEFAULT_NODE_EXECUTION_TIMEOUT;
         private boolean durableTrackingEnabled = DEFAULT_DURABLE_TRACKING_ENABLED;
+        private RollingRestartConfigurationImpl rollingRestartConfiguration = new RollingRestartConfigurationImpl();
 
         protected Builder()
         {
@@ -178,6 +195,11 @@ public class OperationalJobConfigurationImpl implements OperationalJobConfigurat
         public Builder durableTrackingEnabled(boolean durableTrackingEnabled)
         {
             return update(b -> b.durableTrackingEnabled = durableTrackingEnabled);
+        }
+
+        public Builder rollingRestartConfiguration(RollingRestartConfigurationImpl rollingRestartConfiguration)
+        {
+            return update(b -> b.rollingRestartConfiguration = rollingRestartConfiguration);
         }
 
         @Override

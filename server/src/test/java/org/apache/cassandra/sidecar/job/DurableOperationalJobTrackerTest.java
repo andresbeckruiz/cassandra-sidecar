@@ -351,7 +351,10 @@ class DurableOperationalJobTrackerTest
 
         tracker.computeIfAbsent(jobId, id -> job);
 
-        loopAssert(2, () -> verify(storageProvider).persistJob(any()));
+        loopAssert(2, () -> verify(storageProvider).persistJob(argThat(record ->
+            record.jobId().equals(jobId)
+            && record.status() == FAILED
+            && "An active operation already exists".equals(record.failureReason()))));
         verify(storageProvider, never()).updateNodeStatuses(any(), any(), any());
         verify(storageProvider, never()).updateJobStatus(any(), any(), eq(RUNNING), any());
     }

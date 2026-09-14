@@ -468,10 +468,23 @@ operational_job:
   coordination_enabled: false
   # Polling interval for the local coordinator
   local_job_coordination_delay: 3m
-  # Max time a node's local job will execute before marked as failed
+  # Default max time a node's local job may run before it is marked failed. Specific job types can override
+  # this with their own bound.
   node_execution_timeout: 10m
   # Uses the durable job tracker when true, otherwise the in-memory tracker
   durable_tracking_enabled: false
+  rolling_restart:
+    enabled: false
+    # Max wait for the ring to be healthy before stopping a node
+    cassandra_health_timeout: 60s
+    # Max time for a single node lifecycle transition (stop/start)
+    node_state_transition_timeout: 600s
+    # Restart retries per node beyond the first attempt. 0 means a single attempt without a retry
+    node_restart_retry_attempts: 3
+    # Minimum settle time after an execution group finishes before the next may start, letting just-restarted
+    # nodes warm their caches. This configured value acts as a floor, as Sidecar only notices predecessor
+    # completion on a poll cycle (configured by local_job_coordination_delay). 0s disables the wait.
+    wait_between_execution_groups: 3m
 
 s3_client:
   concurrency: 4

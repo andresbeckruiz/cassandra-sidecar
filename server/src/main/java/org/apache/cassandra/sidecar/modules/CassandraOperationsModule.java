@@ -18,6 +18,9 @@
 
 package org.apache.cassandra.sidecar.modules;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import com.google.inject.AbstractModule;
 import com.google.inject.Provides;
 import com.google.inject.Singleton;
@@ -41,6 +44,8 @@ import org.apache.cassandra.sidecar.common.response.TableStatsResponse;
 import org.apache.cassandra.sidecar.common.response.TokenRangeReplicasResponse;
 import org.apache.cassandra.sidecar.common.response.v2.V2NodeSettings;
 import org.apache.cassandra.sidecar.concurrent.ExecutorPools;
+import org.apache.cassandra.sidecar.config.OperationalJobConfiguration;
+import org.apache.cassandra.sidecar.config.RollingRestartConfiguration;
 import org.apache.cassandra.sidecar.config.ServiceConfiguration;
 import org.apache.cassandra.sidecar.config.SidecarConfiguration;
 import org.apache.cassandra.sidecar.db.schema.TableSchema;
@@ -75,6 +80,9 @@ import org.apache.cassandra.sidecar.job.OperationalJobCoordinator;
 import org.apache.cassandra.sidecar.job.OperationalJobTracker;
 import org.apache.cassandra.sidecar.job.StorageBackedLocalJobCoordinator;
 import org.apache.cassandra.sidecar.job.StorageBackedOperationalJobCoordinator;
+import org.apache.cassandra.sidecar.job.restart.ReplicaScopeHealthChecker;
+import org.apache.cassandra.sidecar.job.restart.RestartHealthChecker;
+import org.apache.cassandra.sidecar.job.restart.RestartLocalJobFactory;
 import org.apache.cassandra.sidecar.job.storage.StorageProvider;
 import org.apache.cassandra.sidecar.modules.multibindings.KeyClassMapKey;
 import org.apache.cassandra.sidecar.modules.multibindings.PeriodicTaskMapKeys;
@@ -89,6 +97,7 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.media.Content;
 import org.eclipse.microprofile.openapi.annotations.media.Schema;
 import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Provides the capability to query and invoke Cassandra operations
@@ -96,13 +105,88 @@ import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
 @Path("/")
 public class CassandraOperationsModule extends AbstractModule
 {
+    @Nullable
+    private final SidecarConfiguration configuration;
+
+    /**
+     * @param configuration the already-parsed sidecar configuration, or {@code null} for tests that supply
+     *                      bindings via {@code Modules.override()} and do not exercise startup config validation
+     */
+    public CassandraOperationsModule(@Nullable SidecarConfiguration configuration)
+    {
+        this.configuration = configuration;
+    }
+
     @Override
     protected void configure()
     {
+        if (configuration != null)
+        {
+            validateOperationalJobConfiguration(
+            configuration.operationalJobConfiguration(),
+            configuration.serviceConfiguration().schemaKeyspaceConfiguration().isEnabled());
+        }
         bind(LocalJobManager.class).in(Singleton.class);
-        bind(LocalJobFactory.class).toInstance((operationId, nodeId, instanceHost, operationType) -> {
-            throw new UnsupportedOperationException("No LocalJob implementation for " + operationType);
-        });
+        bind(LocalJobFactory.class).to(RestartLocalJobFactory.class).in(Singleton.class);
+        bind(RestartHealthChecker.class).to(ReplicaScopeHealthChecker.class).in(Singleton.class);
+    }
+
+    /**
+     * Validate that job coordination and durable tracking are enabled when a cluster-wide operational job is
+     * enabled. Also validate that Sidecar schema is enabled if any of these features are enabled.
+     */
+    static void validateOperationalJobConfiguration(OperationalJobConfiguration config, boolean schemaEnabled)
+    {
+        boolean durableTracking = config.durableTrackingEnabled();
+        boolean coordination = config.coordinationEnabled();
+
+        if (!schemaEnabled)
+        {
+            List<String> requiresSchema = new ArrayList<>();
+            if (durableTracking)
+            {
+                requiresSchema.add("durable_tracking_enabled");
+            }
+            if (coordination)
+            {
+                requiresSchema.add("coordination_enabled");
+            }
+            if (!requiresSchema.isEmpty())
+            {
+                throw new IllegalArgumentException(
+                "Invalid operational_job configuration: the following features persist to the Sidecar schema and "
+                + "require sidecar.schema.is_enabled to be true: " + requiresSchema);
+            }
+        }
+
+        if (!config.rollingRestartConfiguration().enabled())
+        {
+            return;
+        }
+
+        List<String> disabled = new ArrayList<>();
+        if (!coordination)
+        {
+            disabled.add("coordination_enabled");
+        }
+        if (!durableTracking)
+        {
+            disabled.add("durable_tracking_enabled");
+        }
+
+        if (!disabled.isEmpty())
+        {
+            throw new IllegalArgumentException(
+            "Invalid operational_job configuration: rolling_restart.enabled is true but requires "
+            + "coordination_enabled and durable_tracking_enabled to be enabled. Disabled: " + disabled);
+        }
+    }
+
+    @Provides
+    @Singleton
+    RollingRestartConfiguration rollingRestartConfiguration(SidecarConfiguration sidecarConfiguration)
+    {
+        return sidecarConfiguration.operationalJobConfiguration().rollingRestartConfiguration();
     }
 
     /**

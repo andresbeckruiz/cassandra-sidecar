@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.sidecar.lifecycle;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.distributed.api.IInstance;
@@ -30,6 +32,8 @@ import org.apache.cassandra.sidecar.cluster.instance.InstanceMetadata;
 public class InJvmDTestLifecycleProvider implements LifecycleProvider
 {
     private final Iterable<? extends IInstance> instances;
+    // Resolved hosts are remembered because an instance can only report its broadcast address while it is running
+    private final Map<String, IInstance> instancesByHost = new ConcurrentHashMap<>();
 
     public InJvmDTestLifecycleProvider(Iterable<? extends IInstance> instances)
     {
@@ -62,14 +66,36 @@ public class InJvmDTestLifecycleProvider implements LifecycleProvider
         return !getInstance(host).isShutdown();
     }
 
+    /**
+     * Resolves the instance for {@code instanceMetadata}, remembering each host it resolves.
+     *
+     * <p>On some Cassandra versions {@link IInstance#broadcastAddress()} is routed through the dtest delegate,
+     * which is discarded when an instance shuts down, so scanning throws once any instance is stopped. That would
+     * leave a stopped instance unresolvable and therefore impossible to start again, so the remembered hosts are
+     * used to answer when the scan cannot. An instance is always resolved while it is still up — that is how it
+     * got stopped — so it is remembered by the time starting it needs it.</p>
+     */
     private IInstance getInstance(InstanceMetadata instanceMetadata)
     {
-        for (IInstance instance : instances)
+        try
         {
-            if (instance.broadcastAddress().getHostName().equals(instanceMetadata.host()))
+            for (IInstance instance : instances)
             {
-                return instance;
+                if (instance.broadcastAddress().getHostName().equals(instanceMetadata.host()))
+                {
+                    instancesByHost.put(instanceMetadata.host(), instance);
+                    return instance;
+                }
             }
+        }
+        catch (IllegalStateException e)
+        {
+            IInstance known = instancesByHost.get(instanceMetadata.host());
+            if (known != null)
+            {
+                return known;
+            }
+            throw e;
         }
         throw new IllegalArgumentException("No instance found for host: " + instanceMetadata);
     }
