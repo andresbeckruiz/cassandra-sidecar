@@ -51,6 +51,7 @@ public class OperationalJobResponse
     private final List<UUID> nodesExecuting;
     private final List<UUID> nodesSucceeded;
     private final List<UUID> nodesFailed;
+    private final List<UUID> nodesAborted;
     @JsonSerialize(using = InstantIso8601Serializer.class)
     @JsonDeserialize(using = InstantIso8601Deserializer.class)
     private final Instant lastUpdate;
@@ -65,6 +66,7 @@ public class OperationalJobResponse
                                   @JsonProperty("nodesExecuting") List<UUID> nodesExecuting,
                                   @JsonProperty("nodesSucceeded") List<UUID> nodesSucceeded,
                                   @JsonProperty("nodesFailed") List<UUID> nodesFailed,
+                                  @JsonProperty("nodesAborted") List<UUID> nodesAborted,
                                   @JsonProperty("lastUpdate") Instant lastUpdate)
     {
         this.jobId = jobId;
@@ -76,6 +78,7 @@ public class OperationalJobResponse
         this.nodesExecuting = nodesExecuting;
         this.nodesSucceeded = nodesSucceeded;
         this.nodesFailed = nodesFailed;
+        this.nodesAborted = nodesAborted;
         this.lastUpdate = lastUpdate;
     }
 
@@ -90,6 +93,7 @@ public class OperationalJobResponse
         this.nodesExecuting = builder.nodesExecuting;
         this.nodesSucceeded = builder.nodesSucceeded;
         this.nodesFailed = builder.nodesFailed;
+        this.nodesAborted = builder.nodesAborted;
         this.lastUpdate = builder.lastUpdate;
     }
 
@@ -183,6 +187,15 @@ public class OperationalJobResponse
     }
 
     /**
+     * @return the list of nodes that were aborted
+     */
+    @JsonProperty("nodesAborted")
+    public List<UUID> nodesAborted()
+    {
+        return nodesAborted;
+    }
+
+    /**
      * @return the time of the last status update
      */
     @JsonProperty("lastUpdate")
@@ -205,6 +218,7 @@ public class OperationalJobResponse
         private List<UUID> nodesExecuting;
         private List<UUID> nodesSucceeded;
         private List<UUID> nodesFailed;
+        private List<UUID> nodesAborted;
         private Instant lastUpdate;
 
         private Builder()
@@ -314,6 +328,17 @@ public class OperationalJobResponse
         public Builder nodesFailed(List<UUID> nodesFailed)
         {
             return update(b -> b.nodesFailed = nodesFailed);
+        }
+
+        /**
+         * Sets the {@code nodesAborted} and returns a reference to this Builder enabling method chaining.
+         *
+         * @param nodesAborted the {@code nodesAborted} to set
+         * @return a reference to this Builder
+         */
+        public Builder nodesAborted(List<UUID> nodesAborted)
+        {
+            return update(b -> b.nodesAborted = nodesAborted);
         }
 
         /**

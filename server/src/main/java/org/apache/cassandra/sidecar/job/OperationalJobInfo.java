@@ -19,6 +19,7 @@
 package org.apache.cassandra.sidecar.job;
 
 import java.time.Instant;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 
@@ -93,6 +94,15 @@ public interface OperationalJobInfo
      */
     @NotNull
     List<UUID> nodesFailed();
+
+    /**
+     * @return list of node UUIDs the job was aborted on
+     */
+    @NotNull
+    default List<UUID> nodesAborted()
+    {
+        return Collections.emptyList();
+    }
 
     /**
      * @return the time of the last status update, or {@code null} if not yet started

@@ -32,6 +32,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import com.datastax.driver.core.utils.UUIDs;
 import io.vertx.core.Future;
@@ -58,6 +60,7 @@ import org.apache.cassandra.sidecar.utils.TimeProvider;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -526,26 +529,7 @@ class StorageBackedLocalJobCoordinatorTest
     @Test
     void testFailedPredecessorReportsSuccessorFailedWhenRequiresPredecessorSuccessTrue()
     {
-        localJobFactory = new LocalJobFactory()
-        {
-            @Override
-            public LocalJob createJob(UUID opId, UUID nodeId, String host, OperationType opType)
-            {
-                return new LocalJob(opId, nodeId, host, opType)
-                {
-                    @Override
-                    protected void executeInternal()
-                    {
-                    }
-                };
-            }
-
-            @Override
-            public boolean requiresPredecessorSuccess()
-            {
-                return true;
-            }
-        };
+        localJobFactory = predecessorSuccessTestFactory();
         buildCoordinator(defaultConfig());
         OperationalJobRecord jobRecord = createJobRecord(Arrays.asList(
         Arrays.asList(NODE_1),
@@ -633,7 +617,59 @@ class StorageBackedLocalJobCoordinatorTest
         executeAndWait();
 
         verify(storageProvider).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.RUNNING);
-        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1)).isNotNull();
+        verify(storageProvider, timeout(5000)).updateNodeStatus(OPERATION_ID, NODE_1,
+                                                                OperationalJobStatus.SUCCEEDED);
+    }
+
+    @Test
+    void testJobHandleIsHeldUntilTheTerminalRowIsWritten() throws InterruptedException
+    {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        localJobFactory = (opId, nodeId, host, opType) -> new LocalJob(opId, nodeId, host, opType)
+        {
+            @Override
+            protected void executeInternal()
+            {
+                started.countDown();
+                try
+                {
+                    assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+                }
+                catch (InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        buildCoordinator(defaultConfig());
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID))
+        .thenReturn(createJobRecord(Arrays.asList(Arrays.asList(NODE_1))));
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(new HashMap<>());
+
+        executeAndWait();
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1))
+        .describedAs("the handle is what tells settlement this Sidecar still owes the node a row")
+        .isNotNull();
+
+        release.countDown();
+        verify(storageProvider, timeout(5000)).updateNodeStatus(OPERATION_ID, NODE_1,
+                                                                OperationalJobStatus.SUCCEEDED);
+
+        long deadline = System.currentTimeMillis() + 5000;
+        while (localJobManager.getJob(OPERATION_ID, NODE_1) != null && System.currentTimeMillis() < deadline)
+        {
+            Thread.sleep(20);
+        }
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1))
+        .describedAs("once the row is written the node is settled and the handle must not keep blocking it")
+        .isNull();
     }
 
     @Test
@@ -1188,6 +1224,715 @@ class StorageBackedLocalJobCoordinatorTest
         assertThat(initialDelayMs).isBetween(0L, delayMs);
     }
 
+    @Test
+    void testFailedJobRecordStopsFurtherSubmission()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.FAILED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(new HashMap<>());
+
+        executeAndWait();
+
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.RUNNING);
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1)).isNull();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = OperationalJobStatus.class, names = {"FAILED", "ABORTED"})
+    void testTerminalJobRecordCancelsInFlightLocalJob(OperationalJobStatus terminalStatus)
+    throws InterruptedException
+    {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch cancelObserved = new CountDownLatch(1);
+        localJobFactory = (opId, nodeId, host, opType) -> new LocalJob(opId, nodeId, host, opType)
+        {
+            @Override
+            protected void executeInternal()
+            {
+                started.countDown();
+                while (!isCancelled())
+                {
+                    try
+                    {
+                        Thread.sleep(20);
+                    }
+                    catch (InterruptedException e)
+                    {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                cancelObserved.countDown();
+            }
+        };
+        buildCoordinator(defaultConfig());
+
+        List<List<UUID>> executionOrder = Arrays.asList(Arrays.asList(NODE_1));
+        OperationalJobRecord running = createJobRecord(OperationType.DRAIN, OperationalJobStatus.RUNNING,
+                                                       executionOrder);
+        OperationalJobRecord terminal = createJobRecord(OperationType.DRAIN, terminalStatus, executionOrder);
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(running, terminal);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+
+        statuses.put(NODE_1, OperationalJobStatus.RUNNING);
+        executeAndWait();
+
+        assertThat(cancelObserved.await(5, TimeUnit.SECONDS))
+        .describedAs("A job still running for an operation recorded as " + terminalStatus
+                     + " must be cancelled, not just dropped")
+        .isTrue();
+    }
+
+    @Test
+    void testLocalJobCancelledOnceItsOperationNoLongerHoldsALock() throws InterruptedException
+    {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch cancelObserved = new CountDownLatch(1);
+        localJobFactory = (opId, nodeId, host, opType) -> new LocalJob(opId, nodeId, host, opType)
+        {
+            @Override
+            protected void executeInternal()
+            {
+                started.countDown();
+                while (!isCancelled())
+                {
+                    try
+                    {
+                        Thread.sleep(20);
+                    }
+                    catch (InterruptedException e)
+                    {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                cancelObserved.countDown();
+            }
+        };
+        buildCoordinator(defaultConfig());
+
+        List<List<UUID>> executionOrder = Arrays.asList(Arrays.asList(NODE_1));
+        OperationalJobRecord running = createJobRecord(OperationType.DRAIN, OperationalJobStatus.RUNNING,
+                                                       executionOrder);
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(running);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(new HashMap<>());
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+
+        executeAndWait();
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+
+        // The operation's lock is gone, which can happen if a force abort settles rows this Sidecar 
+        // does not own
+        UUID otherOperationId = UUIDs.timeBased();
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.RESTART, otherOperationId));
+        when(storageProvider.findJob(otherOperationId)).thenReturn(null);
+
+        executeAndWait();
+
+        assertThat(cancelObserved.await(5, TimeUnit.SECONDS))
+        .describedAs("a job whose operation no longer holds a lock must be cancelled, not left to its own timeout")
+        .isTrue();
+    }
+    
+    @Test
+    void testCancelledJobThatRanToCompletionStillReportsSucceeded() throws InterruptedException
+    {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        localJobFactory = (opId, nodeId, host, opType) -> new LocalJob(opId, nodeId, host, opType)
+        {
+            @Override
+            protected void executeInternal()
+            {
+                started.countDown();
+                try
+                {
+                    // Returns normally without re-checking isCancelled(), standing in for a job that slips past
+                    // its last checkpoint before the cancellation lands.
+                    assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+                }
+                catch (InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        buildCoordinator(defaultConfig());
+
+        List<List<UUID>> executionOrder = Arrays.asList(Arrays.asList(NODE_1));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(storageProvider.findJob(OPERATION_ID))
+        .thenReturn(createJobRecord(OperationType.DRAIN, OperationalJobStatus.RUNNING, executionOrder));
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(new HashMap<>());
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+
+        executeAndWait();
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+
+        UUID otherOperationId = UUIDs.timeBased();
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.RESTART, otherOperationId));
+        when(storageProvider.findJob(otherOperationId)).thenReturn(null);
+        executeAndWait();
+
+        release.countDown();
+
+        // The node really did complete its work, so SUCCEEDED is the truthful record even though the operation
+        // was abandoned and the job cancelled.
+        verify(storageProvider, timeout(5000))
+        .updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.SUCCEEDED);
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.FAILED);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = OperationalJobStatus.class, names = {"FAILED", "ABORTED"})
+    void testFinalizationReleasesLocksForAnAlreadyTerminalJobRecord(OperationalJobStatus terminalStatus)
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, terminalStatus,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, terminalStatus);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+        when(operationalJobCoordinator.clearActive(OperationType.DRAIN, OPERATION_ID, null)).thenReturn(true);
+
+        executeAndWait();
+
+        // Self-heal: a finalization whose clearActive did not take leaves a terminal record still holding its lock,
+        // and only a later poll re-running finalization can release it.
+        verify(operationalJobCoordinator).clearActive(OperationType.DRAIN, OPERATION_ID, null);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = OperationalJobStatus.class, names = {"FAILED", "ABORTED"})
+    void testFinalizationDoesNotRewriteAnAlreadyTerminalJobStatus(OperationalJobStatus terminalStatus)
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, terminalStatus,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, terminalStatus);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+        when(operationalJobCoordinator.clearActive(OperationType.DRAIN, OPERATION_ID, null)).thenReturn(true);
+
+        executeAndWait();
+
+        verify(storageProvider, never()).updateJobStatus(any(), any(), any(), any());
+    }
+
+    @Test
+    void testLocalNodeAlreadyAborted()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(Arrays.asList(
+        Arrays.asList(NODE_1)
+        ));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.ABORTED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1)).isNull();
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.RUNNING);
+    }
+
+    @Test
+    void testAbortedJobRecordStopsFurtherSubmission()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(new HashMap<>());
+
+        executeAndWait();
+
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.RUNNING);
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1)).isNull();
+    }
+
+    @Test
+    void testAbandonedOperationSettlesALocalNodeThatNeverStarted()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.CREATED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+        when(operationalJobCoordinator.clearActive(OperationType.DRAIN, OPERATION_ID, null)).thenReturn(true);
+
+        executeAndWait();
+
+        // Nothing else would ever write this row: the node has no local job to report through.
+        verify(storageProvider).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.ABORTED);
+        verify(operationalJobCoordinator).clearActive(OperationType.DRAIN, OPERATION_ID, null);
+    }
+
+    @Test
+    void testAbandonedOperationSettlesLocalNodesWithTheRecordStatus()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.FAILED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.CREATED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+
+        verify(storageProvider).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.FAILED);
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.ABORTED);
+    }
+
+    @Test
+    void testAbandonedOperationDoesNotSettleNodesOwnedByOtherSidecars()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1),
+                                                                       Arrays.asList(NODE_2)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.CREATED);
+        statuses.put(NODE_2, OperationalJobStatus.CREATED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+
+        verify(storageProvider).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.ABORTED);
+        verify(storageProvider, never()).updateNodeStatus(eq(OPERATION_ID), eq(NODE_2), any());
+        verify(operationalJobCoordinator, never()).clearActive(any(), any(), any());
+    }
+
+    @Test
+    void testAbandonedOperationRecoversANodeLeftRunningByACrashedSidecar() throws InterruptedException
+    {
+        CountDownLatch recovered = new CountDownLatch(1);
+        localJobFactory = (opId, nodeId, host, opType) -> new LocalJob(opId, nodeId, host, opType)
+        {
+            @Override
+            protected void executeInternal()
+            {
+            }
+
+            @Override
+            public Future<Void> onJobFailed()
+            {
+                recovered.countDown();
+                return Future.succeededFuture();
+            }
+        };
+        buildCoordinator(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        // RUNNING with no local job handle: the node started under a Sidecar process that has since gone away,
+        // so no completion callback will ever report for it.
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.RUNNING);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+
+        verify(storageProvider).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.FAILED);
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.ABORTED);
+        assertThat(recovered.await(5, TimeUnit.SECONDS))
+        .describedAs("a node left part-way through its operation must still be reconciled, or an aborted restart "
+                     + "leaves Cassandra down with nothing trying to bring it back")
+        .isTrue();
+    }
+
+    @Test
+    void testLockSurvivesAbortUntilTheLocalJobStopsAndItsRowSettles() throws InterruptedException
+    {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        localJobFactory = (opId, nodeId, host, opType) -> new LocalJob(opId, nodeId, host, opType)
+        {
+            @Override
+            protected void executeInternal()
+            {
+                started.countDown();
+                try
+                {
+                    assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+                }
+                catch (InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        buildCoordinator(defaultConfig());
+
+        List<List<UUID>> executionOrder = Arrays.asList(Arrays.asList(NODE_1));
+        OperationalJobRecord running = createJobRecord(OperationType.DRAIN, OperationalJobStatus.RUNNING,
+                                                       executionOrder);
+        OperationalJobRecord aborted = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                       executionOrder);
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(running, aborted);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+        when(operationalJobCoordinator.clearActive(OperationType.DRAIN, OPERATION_ID, null)).thenReturn(true);
+
+        executeAndWait();
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+        statuses.put(NODE_1, OperationalJobStatus.RUNNING);
+
+        executeAndWait();
+
+        // The job is still running, so its row must stay non-terminal and the lock must stay held. Releasing here
+        // is what would let a new operation start alongside a restart that has not actually stopped.
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1)).isNotNull();
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.ABORTED);
+        verify(operationalJobCoordinator, never()).clearActive(any(), any(), any());
+
+        release.countDown();
+        verify(storageProvider, timeout(5000)).updateNodeStatus(OPERATION_ID, NODE_1,
+                                                                OperationalJobStatus.SUCCEEDED);
+        statuses.put(NODE_1, OperationalJobStatus.SUCCEEDED);
+
+        executeAndWait();
+
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1)).isNull();
+        verify(operationalJobCoordinator).clearActive(OperationType.DRAIN, OPERATION_ID, null);
+    }
+
+    @Test
+    void testFinalizationReleasesLocksWhenAllNodesAborted()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.ABORTED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+        when(operationalJobCoordinator.clearActive(OperationType.DRAIN, OPERATION_ID, null)).thenReturn(true);
+
+        executeAndWait();
+
+        verify(operationalJobCoordinator).clearActive(OperationType.DRAIN, OPERATION_ID, null);
+        verify(storageProvider, never()).updateJobStatus(any(), any(), any(), any());
+    }
+
+    @Test
+    void testAbortedNodesDoNotFinalizeAsSucceeded()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(Arrays.asList(
+        Arrays.asList(NODE_1)
+        ));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.ABORTED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+        when(operationalJobCoordinator.clearActive(OperationType.DRAIN, OPERATION_ID, null)).thenReturn(true);
+
+        executeAndWait();
+
+        verify(storageProvider).updateJobStatus(eq(OPERATION_ID), eq(OperationType.DRAIN),
+                                                eq(OperationalJobStatus.FAILED), any());
+    }
+
+    @Test
+    void testAbortedPredecessorCascadesAbortedRatherThanFailed()
+    {
+        localJobFactory = predecessorSuccessTestFactory();
+        buildCoordinator(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(Arrays.asList(
+        Arrays.asList(NODE_1),
+        Arrays.asList(NODE_2)
+        ));
+        setupSingleNodeInstance(NODE_2, "127.0.0.2");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.ABORTED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+
+        // Guards against collapsing the cascade back onto a FAILED-only check, which would leave the successor
+        // waiting forever on a predecessor that can never succeed.
+        verify(storageProvider).updateNodeStatus(OPERATION_ID, NODE_2, OperationalJobStatus.ABORTED);
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_2, OperationalJobStatus.RUNNING);
+    }
+
+    @Test
+    void testNoActiveOperationsCancelsLeftoverLocalJobs() throws InterruptedException
+    {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch cancelObserved = new CountDownLatch(1);
+        localJobFactory = (opId, nodeId, host, opType) -> new LocalJob(opId, nodeId, host, opType)
+        {
+            @Override
+            protected void executeInternal()
+            {
+                started.countDown();
+                while (!isCancelled())
+                {
+                    try
+                    {
+                        Thread.sleep(20);
+                    }
+                    catch (InterruptedException e)
+                    {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                cancelObserved.countDown();
+            }
+        };
+        buildCoordinator(defaultConfig());
+
+        OperationalJobRecord jobRecord = createJobRecord(Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID), Collections.emptyMap());
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(new HashMap<>());
+
+        executeAndWait();
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+
+        executeAndWait();
+
+        assertThat(cancelObserved.await(5, TimeUnit.SECONDS))
+        .describedAs("Resetting state must cancel leftover jobs, not just drop their handles")
+        .isTrue();
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1)).isNull();
+    }
+
+    @Test
+    void testNodeIsNotSettledWhileItsLocalJobStillOwesARowWrite() throws Exception
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        // A job that has run to completion but whose terminal row this Sidecar has not written yet. Submitting it
+        // through the manager alone reproduces that window: the handle is tracked and its status is already
+        // SUCCEEDED, while storage still reads RUNNING.
+        LocalJob finishedJob = new LocalJob(OPERATION_ID, NODE_1, "127.0.0.1", OperationType.DRAIN)
+        {
+            @Override
+            protected void executeInternal()
+            {
+            }
+        };
+        localJobManager.submitJob(finishedJob).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertThat(finishedJob.status()).isEqualTo(OperationalJobStatus.SUCCEEDED);
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.RUNNING);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+
+        // The node succeeded. Settling it here writes FAILED over an outcome this Sidecar is about to report
+        // correctly, and hands a healthy node a recovery it does not need.
+        verify(storageProvider, never()).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.FAILED);
+    }
+
+    @Test
+    void testPollDischargesARowWriteItsFinishedJobNeverLanded() throws Exception
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        LocalJob finishedJob = new LocalJob(OPERATION_ID, NODE_1, "127.0.0.1", OperationType.DRAIN)
+        {
+            @Override
+            protected void executeInternal()
+            {
+            }
+        };
+        localJobManager.submitJob(finishedJob).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.RUNNING);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+
+        executeAndWait();
+
+        // The job is done and its row never reached storage, so nothing else will ever write it. Skipping the node
+        // on the handle alone would leave the row non-terminal, the lock held, and the handle uncollectable,
+        // because resetState only runs once no operation is active.
+        verify(storageProvider).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.SUCCEEDED);
+        assertThat(localJobManager.getJob(OPERATION_ID, NODE_1))
+        .describedAs("the debt is paid, so the handle must not keep blocking this node")
+        .isNull();
+    }
+
+    @Test
+    void testLockIsHeldWhenSettlingANodeRowFailsToWrite()
+    {
+        buildCoordinatorWithTestFactory(defaultConfig());
+        OperationalJobRecord jobRecord = createJobRecord(OperationType.DRAIN, OperationalJobStatus.ABORTED,
+                                                         Arrays.asList(Arrays.asList(NODE_1)));
+        setupSingleNodeInstance(NODE_1, "127.0.0.1");
+
+        Map<UUID, OperationalJobStatus> statuses = new HashMap<>();
+        statuses.put(NODE_1, OperationalJobStatus.CREATED);
+
+        when(storageProvider.isAvailable()).thenReturn(true);
+        when(operationalJobCoordinator.getActiveOperations())
+        .thenReturn(Collections.singletonMap(OperationType.DRAIN, OPERATION_ID));
+        when(storageProvider.findJob(OPERATION_ID)).thenReturn(jobRecord);
+        when(storageProvider.getNodeStatusesForOperation(OPERATION_ID)).thenReturn(statuses);
+        doThrow(new RuntimeException("Cassandra unavailable"))
+        .when(storageProvider).updateNodeStatus(OPERATION_ID, NODE_1, OperationalJobStatus.ABORTED);
+
+        executeAndWait();
+
+        verify(operationalJobCoordinator, never()).clearActive(any(), any(), any());
+    }
+
+    @Test
+    void testRecoveryReportsTheOutcomeOfOnJobFailed() throws Exception
+    {
+        buildCoordinator(defaultConfig());
+        RuntimeException recoveryFailure = new RuntimeException("could not bring the node back up");
+        LocalJob job = new LocalJob(OPERATION_ID, NODE_1, "127.0.0.1", OperationType.DRAIN)
+        {
+            @Override
+            protected void executeInternal()
+            {
+            }
+
+            @Override
+            public Future<Void> onJobFailed()
+            {
+                return Future.failedFuture(recoveryFailure);
+            }
+        };
+
+        Future<Void> recovery = coordinator.recoverFailedNode(job, OPERATION_ID, NODE_1);
+
+        assertThat(recovery.toCompletionStage().toCompletableFuture())
+        .failsWithin(5, TimeUnit.SECONDS)
+        .withThrowableThat()
+        .withCause(recoveryFailure);
+    }
+
     private OperationalJobConfiguration defaultConfig()
     {
         return new OperationalJobConfigurationImpl();
@@ -1253,6 +1998,30 @@ class StorageBackedLocalJobCoordinatorTest
         };
     }
 
+    private LocalJobFactory predecessorSuccessTestFactory()
+    {
+        return new LocalJobFactory()
+        {
+            @Override
+            public LocalJob createJob(UUID opId, UUID nodeId, String host, OperationType opType)
+            {
+                return new LocalJob(opId, nodeId, host, opType)
+                {
+                    @Override
+                    protected void executeInternal()
+                    {
+                    }
+                };
+            }
+
+            @Override
+            public boolean requiresPredecessorSuccess()
+            {
+                return true;
+            }
+        };
+    }
+
     private LocalJobFactory waitingTestFactory(String waitBetweenExecutionGroups)
     {
         return new LocalJobFactory()
@@ -1284,10 +2053,17 @@ class StorageBackedLocalJobCoordinatorTest
 
     private OperationalJobRecord createJobRecord(OperationType operationType, List<List<UUID>> nodeExecutionOrder)
     {
+        return createJobRecord(operationType, OperationalJobStatus.RUNNING, nodeExecutionOrder);
+    }
+
+    private OperationalJobRecord createJobRecord(OperationType operationType,
+                                                 OperationalJobStatus status,
+                                                 List<List<UUID>> nodeExecutionOrder)
+    {
         return OperationalJobRecord.builder()
                                    .jobId(OPERATION_ID)
                                    .operationType(operationType)
-                                   .status(OperationalJobStatus.RUNNING)
+                                   .status(status)
                                    .nodeExecutionOrder(nodeExecutionOrder)
                                    .build();
     }

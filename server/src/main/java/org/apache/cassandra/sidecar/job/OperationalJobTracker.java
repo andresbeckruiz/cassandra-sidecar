@@ -84,4 +84,27 @@ public interface OperationalJobTracker
      */
     @NotNull
     List<OperationalJobInfo> inflightJobs();
+
+    /**
+     * Records a coordinated cluster-wide operation as aborted at an operator's request. Only updates the 
+     * stored job record.
+     * <p>
+     * Under {@code force} the node job rows in storage of the Sidecars that have not settled their own
+     * are written too.
+     * <p>
+     * An operation that finished on its own cannot be aborted, so it keeps the outcome it recorded. An operation
+     * already aborted can, which is what makes a repeated request converge.
+     * <p>
+     * Only a tracker that stores job state durably can abort, because the abort is a durable transition that the
+     * Sidecars running the operation observe from storage. Implementations that track jobs in-process only throw
+     * {@link UnsupportedOperationException}.
+     * <p>
+     * Performs blocking I/O, so callers must run it off the event loop.
+     *
+     * @param jobId the operation to abort
+     * @param force whether to settle the node rows that the Sidecars owning them have not settled
+     * @return the job as it stands once aborted
+     * @throws UnsupportedOperationException if this tracker does not store job state durably
+     */
+    OperationalJobInfo markJobAsAborted(UUID jobId, boolean force);
 }

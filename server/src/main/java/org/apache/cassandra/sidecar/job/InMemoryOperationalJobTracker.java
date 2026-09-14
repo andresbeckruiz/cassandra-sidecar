@@ -143,6 +143,18 @@ public class InMemoryOperationalJobTracker implements OperationalJobTracker
                          .collect(Collectors.toList());
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Jobs tracked in-process only are not visible to the Sidecars running the operation, so there is no
+     * durable transition for them to observe and nothing to abort.</p>
+     */
+    @Override
+    public OperationalJobInfo markJobAsAborted(UUID jobId, boolean force)
+    {
+        throw new UnsupportedOperationException("Aborting an operational job requires durable job tracking");
+    }
+
     @VisibleForTesting
     OperationalJob put(OperationalJob job)
     {

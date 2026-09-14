@@ -85,6 +85,7 @@ public class ListOperationalJobsHandler extends AbstractHandler<Void> implements
                                                                .nodesExecuting(job.nodesExecuting())
                                                                .nodesSucceeded(job.nodesSucceeded())
                                                                .nodesFailed(job.nodesFailed())
+                                                               .nodesAborted(job.nodesAborted())
                                                                .lastUpdate(job.lastUpdate())
                                                                .build()
                              )

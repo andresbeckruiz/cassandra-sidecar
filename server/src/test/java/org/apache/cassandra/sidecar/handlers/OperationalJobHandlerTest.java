@@ -71,6 +71,7 @@ class OperationalJobHandlerTest
     static UUID runningUuid = UUIDs.timeBased();
     static UUID completedUuid = UUIDs.timeBased();
     static UUID failedUuid = UUIDs.timeBased();
+    static UUID abortedUuid = UUIDs.timeBased();
 
     @BeforeEach
     void before() throws InterruptedException
@@ -163,6 +164,25 @@ class OperationalJobHandlerTest
               }));
     }
 
+    @Test
+    void testGetJobStatusAbortedJob(VertxTestContext context)
+    {
+        WebClient client = WebClient.create(vertx);
+        String testRoute = "/api/v1/cassandra/operational-jobs/" + abortedUuid;
+        client.get(server.actualPort(), "127.0.0.1", testRoute)
+              .expect(ResponsePredicate.SC_OK)
+              .send(context.succeeding(response -> {
+                  assertThat(response.statusCode()).isEqualTo(OK.code());
+                  OperationalJobResponse jobStatus = response.bodyAsJson(OperationalJobResponse.class);
+                  assertThat(jobStatus.jobId()).isEqualTo(abortedUuid);
+                  assertThat(jobStatus.status()).isEqualTo(OperationalJobStatus.ABORTED);
+                  assertThat(jobStatus.operation()).isEqualTo("testAborted");
+                  assertThat(jobStatus.reason()).isEqualTo("Test aborted");
+
+                  context.completeNow();
+              }));
+    }
+
     static class OperationalJobsHandlerTestModule extends AbstractModule
     {
         @Provides
@@ -184,10 +204,16 @@ class OperationalJobHandlerTest
             when(failedMock.status()).thenReturn(OperationalJobStatus.FAILED);
             when(failedMock.failureReason()).thenReturn("Test failed");
             when(failedMock.name()).thenReturn("testFailed");
+            OperationalJob abortedMock = mock(OperationalJob.class);
+            when(abortedMock.jobId()).thenReturn(abortedUuid);
+            when(abortedMock.status()).thenReturn(OperationalJobStatus.ABORTED);
+            when(abortedMock.failureReason()).thenReturn("Test aborted");
+            when(abortedMock.name()).thenReturn("testAborted");
 
             when(mockManager.getJobIfExists(runningUuid)).thenReturn(runningMock);
             when(mockManager.getJobIfExists(completedUuid)).thenReturn(completedMock);
             when(mockManager.getJobIfExists(failedUuid)).thenReturn(failedMock);
+            when(mockManager.getJobIfExists(abortedUuid)).thenReturn(abortedMock);
             return mockManager;
         }
     }

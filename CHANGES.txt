@@ -1,5 +1,6 @@
 0.5.0
 -----
+ * Add PATCH operational-jobs API to abort a cluster-wide job (CASSSIDECAR-379)
  * Add POST /restart API and rolling restart handler (CASSSIDECAR-382)
  * Create rolling restart operational job (CASSSIDECAR-381)
  * Add support for creation and coordination of local Sidecar jobs (CASSSIDECAR-378)

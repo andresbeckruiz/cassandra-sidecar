@@ -29,6 +29,8 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import com.datastax.driver.core.utils.UUIDs;
 import io.vertx.core.Vertx;
@@ -39,10 +41,14 @@ import org.apache.cassandra.sidecar.common.server.utils.MillisecondBoundConfigur
 import org.apache.cassandra.sidecar.concurrent.ExecutorPools;
 import org.apache.cassandra.sidecar.concurrent.TaskExecutorPool;
 import org.apache.cassandra.sidecar.config.yaml.ServiceConfigurationImpl;
+import org.apache.cassandra.sidecar.exceptions.OperationalJobConflictException;
+import org.apache.cassandra.sidecar.exceptions.OperationalJobNotCoordinatedException;
+import org.apache.cassandra.sidecar.exceptions.OperationalJobNotFoundException;
 import org.apache.cassandra.sidecar.job.storage.OperationalJobRecord;
 import org.apache.cassandra.sidecar.job.storage.StorageProvider;
 import org.apache.cassandra.sidecar.job.storage.StorageProviderException;
 
+import static org.apache.cassandra.sidecar.common.data.OperationalJobStatus.ABORTED;
 import static org.apache.cassandra.sidecar.common.data.OperationalJobStatus.CREATED;
 import static org.apache.cassandra.sidecar.common.data.OperationalJobStatus.FAILED;
 import static org.apache.cassandra.sidecar.common.data.OperationalJobStatus.RUNNING;
@@ -711,4 +717,202 @@ class DurableOperationalJobTrackerTest
         verify(storageProvider).findJob(coordinatedJobId);
     }
 
+    @Test
+    void testMarkJobAsAbortedRejectsUnknownJob()
+    {
+        UUID jobId = UUIDs.timeBased();
+        when(storageProvider.findJob(jobId)).thenReturn(null);
+
+        assertThatThrownBy(() -> tracker.markJobAsAborted(jobId, false))
+        .isInstanceOf(OperationalJobNotFoundException.class)
+        .hasMessageContaining(jobId.toString());
+
+        verify(storageProvider, never()).updateJobStatus(any(), any(), any(), any());
+    }
+
+    /**
+     * Force decides what gets written, not what is a valid request, so it does not lift a precondition.
+     */
+    @ParameterizedTest(name = "{0} force={1}")
+    @CsvSource({ "SUCCEEDED,false", "SUCCEEDED,true", "FAILED,false", "FAILED,true" })
+    void testMarkJobAsAbortedRejectsJobThatFinishedOnItsOwn(OperationalJobStatus status, boolean force)
+    {
+        UUID jobId = UUIDs.timeBased();
+        when(storageProvider.findJob(jobId)).thenReturn(coordinatedRecord(jobId, status, twoGroups()));
+
+        assertThatThrownBy(() -> tracker.markJobAsAborted(jobId, force))
+        .isInstanceOf(OperationalJobConflictException.class)
+        .hasMessageContaining("already finished with status " + status);
+
+        verify(storageProvider, never()).updateJobStatus(any(), any(), any(), any());
+        verify(storageProvider, never()).updateNodeStatuses(any(), any(), any());
+    }
+
+
+    @Test
+    void testMarkJobAsAbortedAcceptsAnAlreadyAbortedJob()
+    {
+        UUID jobId = UUIDs.timeBased();
+        List<List<UUID>> executionOrder = twoGroups();
+        UUID pendingNode = executionOrder.get(0).get(0);
+        when(storageProvider.findJob(jobId))
+        .thenReturn(coordinatedRecord(jobId, OperationalJobStatus.ABORTED, executionOrder));
+        Map<UUID, OperationalJobStatus> nodeStatuses = new HashMap<>();
+        nodeStatuses.put(pendingNode, CREATED);
+        when(storageProvider.getNodeStatusesForOperation(jobId)).thenReturn(nodeStatuses);
+
+        OperationalJobInfo aborted = tracker.markJobAsAborted(jobId, true);
+
+        assertThat(aborted.status()).isEqualTo(OperationalJobStatus.ABORTED);
+        verify(storageProvider).updateJobStatus(eq(jobId), eq(OperationType.RESTART),
+                                                eq(OperationalJobStatus.ABORTED), any());
+        verify(storageProvider).updateNodeStatuses(eq(jobId), any(), eq(OperationalJobStatus.ABORTED));
+    }
+
+    @Test
+    void testMarkJobAsAbortedRejectsSingleNodeJob()
+    {
+        UUID jobId = UUIDs.timeBased();
+        when(storageProvider.findJob(jobId)).thenReturn(OperationalJobRecord.builder()
+                                                                             .jobId(jobId)
+                                                                             .operationType(OperationType.DECOMMISSION)
+                                                                             .status(RUNNING)
+                                                                             .build());
+
+        assertThatThrownBy(() -> tracker.markJobAsAborted(jobId, false))
+        .isInstanceOf(OperationalJobNotCoordinatedException.class)
+        .hasMessageContaining("not a coordinated cluster-wide operation");
+
+        verify(storageProvider, never()).updateJobStatus(any(), any(), any(), any());
+    }
+
+    @Test
+    void testMarkJobAsAbortedWritesOnlyTheJobRecord()
+    {
+        UUID jobId = UUIDs.timeBased();
+        List<List<UUID>> executionOrder = twoGroups();
+        when(storageProvider.findJob(jobId)).thenReturn(coordinatedRecord(jobId, RUNNING, executionOrder));
+        when(storageProvider.getNodeStatusesForOperation(jobId))
+        .thenReturn(Map.of(executionOrder.get(0).get(0), SUCCEEDED,
+                           executionOrder.get(1).get(0), RUNNING));
+
+        OperationalJobInfo aborted = tracker.markJobAsAborted(jobId, false);
+
+        assertThat(aborted.status()).isEqualTo(OperationalJobStatus.ABORTED);
+        assertThat(aborted.nodesSucceeded()).containsExactly(executionOrder.get(0).get(0));
+        verify(storageProvider).updateJobStatus(eq(jobId), eq(OperationType.RESTART),
+                                                eq(OperationalJobStatus.ABORTED), any());
+        verify(storageProvider, never()).updateNodeStatuses(any(), any(), any());
+    }
+
+    @Test
+    void testForcedAbortSettlesOutstandingNodesAndLeavesTerminalOnesAlone()
+    {
+        UUID jobId = UUIDs.timeBased();
+        List<List<UUID>> executionOrder = twoGroups();
+        UUID succeededNode = executionOrder.get(0).get(0);
+        UUID runningNode = executionOrder.get(0).get(1);
+        UUID pendingNode = executionOrder.get(1).get(0);
+        UUID unreportedNode = executionOrder.get(1).get(1);
+
+        when(storageProvider.findJob(jobId)).thenReturn(coordinatedRecord(jobId, RUNNING, executionOrder));
+        Map<UUID, OperationalJobStatus> nodeStatuses = new HashMap<>();
+        nodeStatuses.put(succeededNode, SUCCEEDED);
+        nodeStatuses.put(runningNode, RUNNING);
+        nodeStatuses.put(pendingNode, CREATED);
+        when(storageProvider.getNodeStatusesForOperation(jobId)).thenReturn(nodeStatuses);
+
+        OperationalJobInfo aborted = tracker.markJobAsAborted(jobId, true);
+
+        // A node that never started records the operation's status; one abandoned mid-execution records FAILED
+        verify(storageProvider).updateNodeStatuses(jobId, List.of(pendingNode, unreportedNode),
+                                                   OperationalJobStatus.ABORTED);
+        verify(storageProvider).updateNodeStatuses(jobId, List.of(runningNode), FAILED);
+        assertThat(aborted.nodesSucceeded()).containsExactly(succeededNode);
+        assertThat(aborted.nodesFailed())
+        .describedAs("only the node abandoned mid-execution is a failure; the ones never touched must not be "
+                     + "reported as work that went wrong")
+        .containsExactly(runningNode);
+        assertThat(aborted.nodesAborted())
+        .describedAs("the nodes the abort settled without touching are reported as aborted, not lost from the "
+                     + "break down")
+        .containsExactlyInAnyOrder(pendingNode, unreportedNode);
+    }
+
+    @Test
+    void testForcedAbortWritesNoNodeRowsWhenEveryNodeHasSettled()
+    {
+        UUID jobId = UUIDs.timeBased();
+        List<List<UUID>> executionOrder = twoGroups();
+        when(storageProvider.findJob(jobId)).thenReturn(coordinatedRecord(jobId, RUNNING, executionOrder));
+        Map<UUID, OperationalJobStatus> nodeStatuses = new HashMap<>();
+        executionOrder.forEach(group -> group.forEach(nodeId -> nodeStatuses.put(nodeId, SUCCEEDED)));
+        when(storageProvider.getNodeStatusesForOperation(jobId)).thenReturn(nodeStatuses);
+
+        tracker.markJobAsAborted(jobId, true);
+
+        verify(storageProvider, never()).updateNodeStatuses(any(), any(), any());
+    }
+
+    @Test
+    void testAbortReportsTheNodesStillWindingDown()
+    {
+        UUID jobId = UUIDs.timeBased();
+        List<List<UUID>> executionOrder = twoGroups();
+        UUID succeededNode = executionOrder.get(0).get(0);
+        UUID runningNode = executionOrder.get(0).get(1);
+        UUID pendingNode = executionOrder.get(1).get(0);
+
+        when(storageProvider.findJob(jobId)).thenReturn(coordinatedRecord(jobId, RUNNING, executionOrder));
+        when(storageProvider.getNodeStatusesForOperation(jobId))
+        .thenReturn(Map.of(succeededNode, SUCCEEDED, runningNode, RUNNING, pendingNode, CREATED));
+
+        OperationalJobInfo aborted = tracker.markJobAsAborted(jobId, false);
+
+        assertThat(aborted.nodesExecuting()).containsExactly(runningNode);
+        assertThat(aborted.nodesPending()).containsExactly(pendingNode);
+        assertThat(aborted.nodesSucceeded()).containsExactly(succeededNode);
+        assertThat(aborted.nodesFailed()).isEmpty();
+        assertThat(aborted.nodesAborted()).isEmpty();
+    }
+
+    @Test
+    void testGetReportsAbortedNodeRowsSeparatelyFromFailedOnes()
+    {
+        UUID jobId = UUIDs.timeBased();
+        UUID abortedNode = UUIDs.timeBased();
+        UUID failedNode = UUIDs.timeBased();
+
+        when(storageProvider.findJob(jobId))
+        .thenReturn(OperationalJobRecord.builder()
+                                        .jobId(jobId)
+                                        .operationType(OperationType.RESTART)
+                                        .status(ABORTED)
+                                        .build());
+        when(storageProvider.getNodeStatusesForOperation(jobId))
+        .thenReturn(Map.of(abortedNode, ABORTED, failedNode, FAILED));
+
+        OperationalJobInfo result = tracker.get(jobId);
+
+        assertThat(result).isNotNull();
+        assertThat(result.nodesAborted()).containsExactly(abortedNode);
+        assertThat(result.nodesFailed()).containsExactly(failedNode);
+    }
+
+    private static List<List<UUID>> twoGroups()
+    {
+        return List.of(List.of(UUIDs.timeBased(), UUIDs.timeBased()),
+                       List.of(UUIDs.timeBased(), UUIDs.timeBased()));
+    }
+
+    private static OperationalJobRecord coordinatedRecord(UUID jobId, OperationalJobStatus status,
+                                                          List<List<UUID>> executionOrder)
+    {
+        return OperationalJobRecord.builder()
+                                   .jobId(jobId)
+                                   .operationType(OperationType.RESTART)
+                                   .status(status)
+                                   .nodeExecutionOrder(executionOrder)
+                                   .build();
+    }
 }

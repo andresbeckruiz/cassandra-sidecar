@@ -85,6 +85,20 @@ public class OperationalJobManager
     }
 
     /**
+     * Aborts a coordinated cluster-wide operation at an operator's request. 
+     *
+     * <p>Performs blocking I/O, so callers must run it off the event loop.</p>
+     *
+     * @param jobId the operation to abort
+     * @param force whether to settle the node rows that the Sidecars owning them have not settled
+     * @return the job as it stands once aborted
+     */
+    public OperationalJobInfo abortJob(UUID jobId, boolean force)
+    {
+        return jobTracker.markJobAsAborted(jobId, force);
+    }
+
+    /**
      * Try to submit the job to execute asynchronously, if it is not currently being
      * tracked and not running. The job is triggered on a separate internal thread-pool.
      * The job execution failure behavior is tracked within the {@link OperationalJob}.

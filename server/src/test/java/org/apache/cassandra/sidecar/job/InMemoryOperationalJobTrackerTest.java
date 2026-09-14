@@ -246,4 +246,15 @@ class InMemoryOperationalJobTrackerTest
             .extracting(OperationalJobInfo::jobId)
             .containsExactlyInAnyOrder(createdJob.jobId(), runningJob.jobId());
     }
+
+    @Test
+    void testMarkJobAsAbortedIsUnsupported()
+    {
+        InMemoryOperationalJobTracker tracker = new InMemoryOperationalJobTracker(3);
+
+        assertThatThrownBy(() -> tracker.markJobAsAborted(UUIDs.timeBased(), false))
+        .isInstanceOf(UnsupportedOperationException.class)
+        .hasMessageContaining("durable job tracking");
+    }
+
 }

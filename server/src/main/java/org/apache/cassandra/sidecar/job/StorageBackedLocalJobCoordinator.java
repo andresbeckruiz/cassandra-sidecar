@@ -18,9 +18,12 @@
 
 package org.apache.cassandra.sidecar.job;
 
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -32,12 +35,12 @@ import org.slf4j.LoggerFactory;
 
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import org.apache.cassandra.sidecar.cluster.instance.InstanceMetadata;
 import org.apache.cassandra.sidecar.common.data.OperationType;
 import org.apache.cassandra.sidecar.common.data.OperationalJobStatus;
-import org.apache.cassandra.sidecar.common.response.NodeSettings;
 import org.apache.cassandra.sidecar.common.server.utils.DurationSpec;
 import org.apache.cassandra.sidecar.common.server.utils.SecondBoundConfiguration;
 import org.apache.cassandra.sidecar.concurrent.ExecutorPools;
@@ -51,6 +54,8 @@ import org.apache.cassandra.sidecar.tasks.ScheduleDecision;
 import org.apache.cassandra.sidecar.utils.EventBusUtils;
 import org.apache.cassandra.sidecar.utils.InstanceMetadataFetcher;
 import org.apache.cassandra.sidecar.utils.TimeProvider;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
 
 import static org.apache.cassandra.sidecar.server.SidecarServerEvents.ON_CASSANDRA_CQL_READY;
 
@@ -63,7 +68,9 @@ import static org.apache.cassandra.sidecar.server.SidecarServerEvents.ON_CASSAND
 public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, PeriodicTask
 {
     private static final Logger LOGGER = LoggerFactory.getLogger(StorageBackedLocalJobCoordinator.class);
-    private static final int MAX_NODE_STATUS_RETRIES = 5;
+    // Gives about 5.5 minutes of retries, in case the local node or the instances selected by
+    // SidecarLoadBalancingPolicy are not CQL-ready
+    private static final int MAX_NODE_STATUS_RETRIES = 12;
     private static final long NODE_STATUS_RETRY_DELAY_MS = 5000;
 
     private final OperationalJobCoordinator operationalJobCoordinator;
@@ -74,7 +81,6 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
     private final LocalJobFactory localJobFactory;
     private final long defaultNodeExecutionTimeoutMs;
 
-    private final Map<UUID, OperationalJobRecord> jobRecordCache = new ConcurrentHashMap<>();
     // When this Sidecar first saw a group's predecessors all reach a terminal state, keyed by operation and group.
     private final Map<GroupKey, Long> predecessorsCompletedAtNanos = new ConcurrentHashMap<>();
     private final DurationSpec randomizedInitialDelay;
@@ -159,6 +165,8 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
                 return;
             }
 
+            abandonOperationsWithoutLock(activeOps.values());
+
             for (Map.Entry<OperationType, UUID> entry : activeOps.entrySet())
             {
                 OperationType operationType = entry.getKey();
@@ -181,7 +189,15 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
                 // terminal, so stale CREATED entries only delay finalization by one poll cycle.
                 Map<UUID, OperationalJobStatus> nodeStatuses = storageProvider.getNodeStatusesForOperation(operationId);
 
-                trySubmitJobsForLocalInstances(operationId, operationType, jobRecord, nodeExecutionOrder, nodeStatuses);
+                if (jobRecord.status().isUnsuccessful())
+                {
+                    abandonOperation(operationId, jobRecord, nodeExecutionOrder, nodeStatuses);
+                }
+                else
+                {
+                    trySubmitJobsForLocalInstances(operationId, operationType, jobRecord, nodeExecutionOrder,
+                                                   nodeStatuses);
+                }
 
                 checkAndFinalizeJobIfComplete(operationId, operationType, jobRecord, nodeStatuses);
             }
@@ -203,19 +219,12 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
     {
         for (InstanceMetadata instance : instanceMetadataFetcher.allLocalInstances())
         {
-            UUID hostId;
-            String host;
-            try
+            UUID hostId = localHostId(instance);
+            if (hostId == null)
             {
-                NodeSettings nodeSettings = instance.delegate().nodeSettings();
-                hostId = nodeSettings.hostId();
-                host = instance.host();
-            }
-            catch (Exception e)
-            {
-                LOGGER.debug("Skipping instance {} — delegate unavailable", instance.host(), e);
                 continue;
             }
+            String host = instance.host();
 
             int groupIndex = findGroupIndex(hostId, nodeExecutionOrder);
             if (groupIndex < 0)
@@ -226,7 +235,7 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
             OperationalJobStatus currentStatus = nodeStatuses.get(hostId);
 
             // Node has already reached a terminal state — nothing to do
-            if (currentStatus == OperationalJobStatus.SUCCEEDED || currentStatus == OperationalJobStatus.FAILED)
+            if (currentStatus != null && currentStatus.isCompleted())
             {
                 continue;
             }
@@ -249,11 +258,14 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
             boolean requiresPredecessorSuccess = localJobFactory.requiresPredecessorSuccess();
             if (!arePredecessorsComplete(hostId, nodeExecutionOrder, nodeStatuses, requiresPredecessorSuccess))
             {
-                if (requiresPredecessorSuccess && hasFailedPredecessor(hostId, nodeExecutionOrder, nodeStatuses))
+                OperationalJobStatus cascaded = requiresPredecessorSuccess
+                                                ? cascadedPredecessorStatus(hostId, nodeExecutionOrder, nodeStatuses)
+                                                : null;
+                if (cascaded != null)
                 {
-                    LOGGER.warn("Predecessor failed and operation requires predecessor success — marking node {} " +
-                                "as FAILED. operationId={}", hostId, operationId);
-                    reportNodeStatusWithRetry(operationId, hostId, OperationalJobStatus.FAILED, 1);
+                    LOGGER.warn("Predecessor did not succeed and operation requires predecessor success — marking " +
+                                "node {} as {}. operationId={}", hostId, cascaded, operationId);
+                    reportNodeStatusWithRetry(operationId, hostId, cascaded, 1);
                 }
                 // Else, an immediate predecessor is still running, so wait for the next poll. The wait is
                 // inherently bounded because every RUNNING node has its own execution timeout (see submitLocalJob).
@@ -355,13 +367,16 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
         // a race condition between the two.
         // Failing jobs when Sidecar is permanently down will be handled by (https://issues.apache.org/jira/browse/CASSSIDECAR-485).
         AtomicBoolean terminalReported = new AtomicBoolean(false);
+        // Whether the terminal row was actually reported to storage
+        AtomicBoolean terminalPersisted = new AtomicBoolean(false);
         long timeoutMs = resolveNodeExecutionTimeoutMs(operationType);
         long timerId = executorPools.internal().setTimer(timeoutMs, id -> {
             if (terminalReported.compareAndSet(false, true))
             {
                 LOGGER.warn("Node {} exceeded execution timeout of {}ms — marking as FAILED and cancelling the job. "
                             + "operationId={}", hostId, timeoutMs, operationId);
-                reportNodeStatusWithRetry(operationId, hostId, OperationalJobStatus.FAILED, 1);
+                terminalPersisted.set(reportNodeStatusWithRetry(operationId, hostId,
+                                                                OperationalJobStatus.FAILED, 1));
                 // Stop the job from continuing after the operation has given up on it. The job is not interrupted;
                 // it stops at its next isCancelled() check, and recovery then runs on the completion callback below.
                 localJob.cancel();
@@ -373,8 +388,9 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
             if (terminalReported.compareAndSet(false, true))
             {
                 boolean failed = ar.failed();
-                reportNodeStatusWithRetry(operationId, hostId,
-                                          failed ? OperationalJobStatus.FAILED : OperationalJobStatus.SUCCEEDED, 1);
+                terminalPersisted.set(reportNodeStatusWithRetry(operationId, hostId,
+                                                                failed ? OperationalJobStatus.FAILED
+                                                                       : OperationalJobStatus.SUCCEEDED, 1));
                 if (failed)
                 {
                     LOGGER.error("Local job failed for node {}. operationId={}", hostId, operationId, ar.cause());
@@ -386,18 +402,33 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
                 // The timeout already fired and reported FAILED; the job has now stopped, so recover the node.
                 recoverFailedNode(localJob, operationId, hostId);
             }
+
+            // Keep the local job handle until the status is persisted so that the poll loop can retry 
+            if (terminalPersisted.get())
+            {
+                localJobManager.removeJob(operationId, hostId, localJob);
+            }
         });
     }
 
     /**
      * Runs the job's own recovery on its FAILED transition. Invoked only after the job has stopped. Failures
      * are logged and swallowed so recovery can never wedge the poll loop.
+     *
+     * <p>Dispatched to a worker thread so that {@link LocalJob#onJobFailed()} is free to block.</p>
+     *
+     * @return the outcome of running the recovery, which callers on the poll path ignore
      */
-    private void recoverFailedNode(LocalJob localJob, UUID operationId, UUID hostId)
+    @VisibleForTesting
+    Future<Void> recoverFailedNode(LocalJob localJob, UUID operationId, UUID hostId)
     {
-        localJob.onJobFailed()
-                .onFailure(e -> LOGGER.error("onJobFailed recovery failed for node {}. operationId={}",
-                                             hostId, operationId, e));
+        return executorPools.internal()
+                            .executeBlocking(localJob::onJobFailed, false)
+                            // executeBlocking does not flatten, so without this the result is the future recovery
+                            // returned rather than the outcome of running it, and a failure would go unreported.
+                            .compose(recovery -> recovery)
+                            .onFailure(e -> LOGGER.error("onJobFailed recovery failed for node {}. operationId={}",
+                                                         hostId, operationId, e));
     }
 
     private long resolveNodeExecutionTimeoutMs(OperationType operationType)
@@ -414,13 +445,16 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
      * terminal (or its local job handle has completed) later polls short-circuit and never re-report it, so a
      * lost terminal write would keep the node in RUNNING.
      * See {@link #tryReportNodeStatus} for why non-terminal statuses are handled differently.
+     *
+     * @return whether the write to storage was successful
      */
-    private void reportNodeStatusWithRetry(UUID operationId, UUID nodeId,
-                                           OperationalJobStatus status, int attempt)
+    private boolean reportNodeStatusWithRetry(UUID operationId, UUID nodeId,
+                                              OperationalJobStatus status, int attempt)
     {
         try
         {
             reportNodeStatus(operationId, nodeId, status);
+            return true;
         }
         catch (Exception e)
         {
@@ -436,6 +470,7 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
                 LOGGER.error("Exhausted retries reporting status {} for node {}. operationId={}. " +
                              "Manual intervention may be required.", status, nodeId, operationId);
             }
+            return false;
         }
     }
 
@@ -468,11 +503,11 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
                 LOGGER.error("Predecessor node {} has null status — expected a status entry", predecessorId);
                 return false;
             }
-            if (status == OperationalJobStatus.CREATED || status == OperationalJobStatus.RUNNING)
+            if (!status.isCompleted())
             {
                 return false;
             }
-            if (status == OperationalJobStatus.FAILED && requiresPredecessorSuccess)
+            if (requiresPredecessorSuccess && status.isUnsuccessful())
             {
                 return false;
             }
@@ -498,7 +533,7 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
             return;
         }
 
-        boolean anyFailed = nodeStatuses.containsValue(OperationalJobStatus.FAILED);
+        boolean anyUnsuccessful = nodeStatuses.values().stream().anyMatch(OperationalJobStatus::isUnsuccessful);
         boolean allTerminal = true;
 
         for (List<UUID> group : nodeExecutionOrder)
@@ -508,9 +543,9 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
                 OperationalJobStatus status = nodeStatuses.get(nodeId);
                 if (status == null)
                 {
-                    if (anyFailed)
+                    if (anyUnsuccessful)
                     {
-                        LOGGER.warn("Node {} has null status but other nodes have failed — treating as FAILED. " +
+                        LOGGER.warn("Node {} has null status but other nodes did not succeed — treating as FAILED. " +
                                     "operationId={}", nodeId, operationId);
                         continue;
                     }
@@ -523,9 +558,9 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
                     allTerminal = false;
                     break;
                 }
-                if (status == OperationalJobStatus.FAILED)
+                if (status.isUnsuccessful())
                 {
-                    anyFailed = true;
+                    anyUnsuccessful = true;
                 }
             }
             if (!allTerminal)
@@ -539,14 +574,23 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
             return;
         }
 
-        OperationalJobStatus overallStatus = anyFailed ? OperationalJobStatus.FAILED : OperationalJobStatus.SUCCEEDED;
-        String failureReason = anyFailed ? "One or more nodes failed during operation" : null;
-        storageProvider.updateJobStatus(operationId, operationType, overallStatus, failureReason);
+        // A record already in a terminal state carries an outcome that another Sidecar, or an operator aborting the
+        // operation by hand, already recorded. Re-writing it would replace that reason with the generic one below,
+        // and would downgrade an ABORTED record to FAILED.
+        boolean recordAlreadyTerminal = jobRecord.status().isCompleted();
+        OperationalJobStatus overallStatus = anyUnsuccessful ? OperationalJobStatus.FAILED
+                                                             : OperationalJobStatus.SUCCEEDED;
+        if (!recordAlreadyTerminal)
+        {
+            String failureReason = anyUnsuccessful ? "One or more nodes failed during operation" : null;
+            storageProvider.updateJobStatus(operationId, operationType, overallStatus, failureReason);
+        }
         // Clear lock held in the local datacenter (null). Active ops are discovered for the local DC in
         // getActiveOperations(), so a finalizer only ever sees operations living in its own local-DC.
         // Therefore, the local DC always equals the target DC the lock was set under.
         operationalJobCoordinator.clearActive(operationType, operationId, null);
-        LOGGER.info("Job finalized. operationId={} operationType={} status={}", operationId, operationType, overallStatus);
+        LOGGER.info("Job finalized. operationId={} operationType={} status={}", operationId, operationType,
+                    recordAlreadyTerminal ? jobRecord.status() : overallStatus);
         cleanupOperationState(operationId);
     }
 
@@ -569,9 +613,14 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
         }
     }
 
+    /**
+     * Reads the job record from storage on every poll rather than caching it for the life of the operation.
+     * The record carries the operation's authoritative status, so a job aborted by an operator, or a finalization 
+     * performed by another Sidecar, has to be observable here.
+     */
     private OperationalJobRecord fetchJobRecord(UUID operationId)
     {
-        return jobRecordCache.computeIfAbsent(operationId, id -> storageProvider.findJob(id));
+        return storageProvider.findJob(operationId);
     }
 
     private int findGroupIndex(UUID nodeId, List<List<UUID>> nodeExecutionOrder)
@@ -586,23 +635,33 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
         return -1;
     }
 
-    private boolean hasFailedPredecessor(UUID nodeId,
-                                         List<List<UUID>> nodeExecutionOrder,
-                                         Map<UUID, OperationalJobStatus> nodeStatuses)
+    /**
+     * The terminal status to settle {@code nodeId} with because an immediate predecessor did not succeed and the
+     * operation requires predecessor success. The predecessor's own status is propagated, so a node that never ran
+     * because an operator aborted the operation records {@code ABORTED} rather than a failure it did not have.
+     *
+     * @return the status to cascade, or {@code null} if every immediate predecessor succeeded
+     */
+    @Nullable
+    private OperationalJobStatus cascadedPredecessorStatus(UUID nodeId,
+                                                           List<List<UUID>> nodeExecutionOrder,
+                                                           Map<UUID, OperationalJobStatus> nodeStatuses)
     {
         int nodeGroupIndex = findGroupIndex(nodeId, nodeExecutionOrder);
         if (nodeGroupIndex <= 0)
         {
-            return false;
+            return null;
         }
         for (UUID predecessorId : nodeExecutionOrder.get(nodeGroupIndex - 1))
         {
-            if (nodeStatuses.get(predecessorId) == OperationalJobStatus.FAILED)
+            // A predecessor with no status row yet is unknown, not unsuccessful, so it cascades nothing
+            OperationalJobStatus status = nodeStatuses.get(predecessorId);
+            if (status != null && status.isUnsuccessful())
             {
-                return true;
+                return status;
             }
         }
-        return false;
+        return null;
     }
 
     /**
@@ -642,39 +701,211 @@ public class StorageBackedLocalJobCoordinator implements LocalJobCoordinator, Pe
         }
     }
 
+    /**
+     * Cancels every local job for the operation. The job's completion callback drops the handle 
+     * once the terminal status has been reported to storage.
+     */
     private void cleanupJobsForOperation(UUID operationId)
     {
         for (LocalJob job : localJobManager.activeJobs())
         {
             if (operationId.equals(job.operationId()))
             {
-                localJobManager.removeJob(job.operationId(), job.nodeId());
+                job.cancel();
             }
         }
     }
 
     /**
-     * Clears the cached record and local job handles for a single operation. Scoped to {@code operationId}
-     * so finalizing one operation does not disturb others that are still active.
+     * Cancels local jobs left over from operations that no longer hold an active-operation lock.
+     *
+     * @param activeOperationIds the operations that currently hold a lock in this datacenter
+     */
+    private void abandonOperationsWithoutLock(Collection<UUID> activeOperationIds)
+    {
+        Set<UUID> abandoned = new HashSet<>();
+        for (LocalJob job : localJobManager.activeJobs())
+        {
+            if (!activeOperationIds.contains(job.operationId()))
+            {
+                abandoned.add(job.operationId());
+            }
+        }
+        for (UUID operationId : abandoned)
+        {
+            LOGGER.warn("Operation no longer holds an active-operation lock; cancelling the local jobs still "
+                        + "running for it and releasing its local state. operationId={}", operationId);
+            cleanupOperationState(operationId);
+        }
+    }
+
+    /**
+     * Stops this Sidecar continuing an operation whose record has reached a terminal status, and settles the node
+     * rows this Sidecar owns.
+     *
+     * <p>A node whose local job is still stopping keeps its row non-terminal until the job reports through its own
+     * completion callback. This is what holds the operation's lock: finalization needs every row terminal, so the
+     * lock cannot be released while any Sidecar still has work in flight. Only rows for this Sidecar's own
+     * instances are written, so every row has exactly one writer.</p>
+     */
+    private void abandonOperation(UUID operationId, OperationalJobRecord jobRecord,
+                                  List<List<UUID>> nodeExecutionOrder,
+                                  Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
+        boolean hasLocalJobs = localJobManager.activeJobs()
+                                              .stream()
+                                              .anyMatch(job -> operationId.equals(job.operationId()));
+        if (hasLocalJobs)
+        {
+            LOGGER.warn("Operation is recorded as {}; cancelling any local job still running for it and "
+                        + "releasing its local state. operationId={}", jobRecord.status(), operationId);
+        }
+        cleanupOperationState(operationId);
+        settleLocalNodes(operationId, jobRecord, nodeExecutionOrder, nodeStatuses);
+    }
+
+    /**
+     * Settles every local instance in the execution order that has not reached a terminal status and has no local
+     * job left to report one.
+     *
+     * <p>{@link NodeSettlement} decides the status each node records. A node abandoned mid-execution is also
+     * reconciled through {@link #settleNodeAbandonedMidExecution}.</p>
+     */
+    private void settleLocalNodes(UUID operationId, OperationalJobRecord jobRecord,
+                                  List<List<UUID>> nodeExecutionOrder,
+                                  Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
+        for (InstanceMetadata instance : instanceMetadataFetcher.allLocalInstances())
+        {
+            UUID hostId = localHostId(instance);
+            if (hostId == null || findGroupIndex(hostId, nodeExecutionOrder) < 0)
+            {
+                continue;
+            }
+
+            OperationalJobStatus currentStatus = nodeStatuses.get(hostId);
+            NodeSettlement settlement = NodeSettlement.of(currentStatus);
+            if (settlement == NodeSettlement.ALREADY_SETTLED)
+            {
+                continue;
+            }
+
+            // Check for presence of handle, not status. A job reaches a terminal status before its completion
+            // callback writes the status to storage
+            LocalJob localJob = localJobManager.getJob(operationId, hostId);
+            if (localJob != null)
+            {
+                if (!localJob.status().isCompleted())
+                {
+                    LOGGER.info("Node {} still has a local job waiting to report status; leaving its status at {} "
+                                + "until the job reports. operationId={}", hostId, currentStatus, operationId);
+                    continue;
+                }
+                dischargeFinishedJobRow(operationId, hostId, localJob, nodeStatuses);
+                continue;
+            }
+
+            if (settlement == NodeSettlement.ABANDONED_MID_EXECUTION)
+            {
+                settleNodeAbandonedMidExecution(operationId, jobRecord, hostId, instance.host(), nodeStatuses);
+                continue;
+            }
+
+            OperationalJobStatus settled = settlement.terminalStatus(jobRecord.status());
+            LOGGER.warn("Settling node {} as {}; the operation was abandoned before this node started executing. "
+                        + "operationId={}", hostId, settled, operationId);
+            if (reportNodeStatusWithRetry(operationId, hostId, settled, 1))
+            {
+                nodeStatuses.put(hostId, settled);
+            }
+        }
+    }
+
+    /**
+     * Writes the terminal status a local job still owes, and releases its handle once that lands.
+     *
+     * <p>The job's completion callback normally does this. It leaves the handle behind when its write did not
+     * reach storage, and nothing re-drives it: the retries inside {@link #reportNodeStatusWithRetry} are finite,
+     * and {@link #resetState} only sweeps handles once no operation is active, which cannot happen while this
+     * node keeps the operation from finalizing. The poll is what breaks that cycle.</p>
+     *
+     * <p>The job's own status is written rather than a settled one, because this Sidecar ran the work and knows
+     * how it ended; settlement would only be guessing at it.</p>
+     */
+    private void dischargeFinishedJobRow(UUID operationId, UUID hostId, LocalJob localJob,
+                                         Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
+        OperationalJobStatus actual = localJob.status();
+        LOGGER.warn("Node {} has a finished local job whose status never reached storage; reporting {} and "
+                    + "releasing the job. operationId={}", hostId, actual, operationId);
+        if (reportNodeStatusWithRetry(operationId, hostId, actual, 1))
+        {
+            nodeStatuses.put(hostId, actual);
+            localJobManager.removeJob(operationId, hostId, localJob);
+        }
+    }
+
+    /**
+     * Settles a node that was executing but has no local job, which happens when the Sidecar process that started
+     * it crashes.
+     */
+    private void settleNodeAbandonedMidExecution(UUID operationId, OperationalJobRecord jobRecord, UUID hostId,
+                                                 String host, Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
+        OperationalJobStatus settled = NodeSettlement.ABANDONED_MID_EXECUTION.terminalStatus(jobRecord.status());
+        LOGGER.warn("Node {} was executing but has no local job; the Sidecar that started it is gone. Marking it "
+                    + "{} and running recovery. operationId={}", hostId, settled, operationId);
+        if (reportNodeStatusWithRetry(operationId, hostId, settled, 1))
+        {
+            nodeStatuses.put(hostId, settled);
+        }
+
+        // Recovery runs whether or not the report landed. The node needs reconciling either way, and a later poll
+        // can try to re-report
+        OperationType operationType = jobRecord.operationType();
+        LocalJob localJob = localJobFactory.createJob(operationId, hostId, host, operationType,
+                                                      jobRecord.operationMetadata());
+        recoverFailedNode(localJob, operationId, hostId);
+    }
+
+    /**
+     * @return the host ID of a local Cassandra instance, or {@code null} if its delegate cannot be reached
+     */
+    @Nullable
+    private UUID localHostId(InstanceMetadata instance)
+    {
+        try
+        {
+            return instance.delegate().nodeSettings().hostId();
+        }
+        catch (Exception e)
+        {
+            LOGGER.debug("Skipping instance {} — delegate unavailable", instance.host(), e);
+            return null;
+        }
+    }
+
+    /**
+     * Clears the local state for a single operation. Scoped to {@code operationId} so finalizing one operation
+     * does not disturb others that are still active.
      */
     private void cleanupOperationState(UUID operationId)
     {
-        jobRecordCache.remove(operationId);
         predecessorsCompletedAtNanos.keySet().removeIf(key -> key.operationId.equals(operationId));
         cleanupJobsForOperation(operationId);
     }
 
     /**
-     * Clears all cached state. Only safe when no operations are active (see the {@code activeOps.isEmpty()}
+     * Clears all local state. Only safe when no operations are active (see the {@code activeOps.isEmpty()}
      * branch); use {@link #cleanupOperationState} to tear down a single finalized operation.
      */
     private void resetState()
     {
-        jobRecordCache.clear();
         predecessorsCompletedAtNanos.clear();
         for (LocalJob job : localJobManager.activeJobs())
         {
-            localJobManager.removeJob(job.operationId(), job.nodeId());
+            job.cancel();
+            localJobManager.removeJob(job.operationId(), job.nodeId(), job);
         }
     }
 }

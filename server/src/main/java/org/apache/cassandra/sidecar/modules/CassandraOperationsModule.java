@@ -26,6 +26,7 @@ import com.google.inject.Provides;
 import com.google.inject.Singleton;
 import com.google.inject.multibindings.ProvidesIntoMap;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.PATCH;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
@@ -70,6 +71,7 @@ import org.apache.cassandra.sidecar.handlers.SchemaHandler;
 import org.apache.cassandra.sidecar.handlers.StreamStatsHandler;
 import org.apache.cassandra.sidecar.handlers.TableStatsHandler;
 import org.apache.cassandra.sidecar.handlers.TokenRangeReplicaMapHandler;
+import org.apache.cassandra.sidecar.handlers.UpdateOperationalJobHandler;
 import org.apache.cassandra.sidecar.handlers.cassandra.NodeSettingsHandler;
 import org.apache.cassandra.sidecar.handlers.v2.cassandra.V2NodeSettingsHandler;
 import org.apache.cassandra.sidecar.handlers.validations.ValidateTableExistenceHandler;
@@ -324,6 +326,37 @@ public class CassandraOperationsModule extends AbstractModule
                                             OperationalJobHandler operationalJobHandler)
     {
         return factory.buildRouteWithHandler(operationalJobHandler);
+    }
+
+    @PATCH
+    @Path(ApiEndpointsV1.OPERATIONAL_JOB_ROUTE)
+    @Operation(summary = "Abort a coordinated operational job",
+               description = "Applies an RFC 6902 JSON Patch of the form "
+                             + "{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"ABORTED\"} to a coordinated "
+                             + "cluster-wide operational job. ABORTED is the only supported value and the reason is "
+                             + "written by the server.")
+    @APIResponse(description = "Operational job recorded as aborted. The cluster winds the operation down and "
+                               + "releases its active-operation lock once every node has stopped.",
+                 responseCode = "202",
+                 content = @Content(mediaType = "application/json",
+                 schema = @Schema(implementation = OperationalJobResponse.class)))
+    @APIResponse(responseCode = "400",
+                 description = "Invalid request - missing or malformed JSON body, an op other than replace, a path "
+                               + "other than /status, a value other than ABORTED, or a job that is not a coordinated "
+                               + "cluster-wide operation and so has no per-node state to settle")
+    @APIResponse(responseCode = "404", description = "No operational job exists with the supplied identifier")
+    @APIResponse(responseCode = "409",
+                 description = "The job already finished on its own, so it keeps the outcome it recorded. Repeating "
+                               + "the request against an already aborted job succeeds.")
+    @ProvidesIntoMap
+    @KeyClassMapKey(VertxRouteMapKeys.CassandraUpdateOperationalJobRouteKey.class)
+    VertxRoute cassandraUpdateOperationalJobRoute(RouteBuilder.Factory factory,
+                                                  UpdateOperationalJobHandler updateOperationalJobHandler)
+    {
+        return factory.builderForRoute()
+                      .setBodyHandler(true)
+                      .handler(updateOperationalJobHandler)
+                      .build();
     }
 
     @GET

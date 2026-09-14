@@ -112,7 +112,7 @@ class LocalJobManagerTest
 
         assertThat(manager.getJob(OPERATION_ID, NODE_ID_1)).isSameAs(job);
 
-        manager.removeJob(OPERATION_ID, NODE_ID_1);
+        assertThat(manager.removeJob(OPERATION_ID, NODE_ID_1, job)).isTrue();
         assertThat(manager.getJob(OPERATION_ID, NODE_ID_1)).isNull();
     }
 
@@ -144,7 +144,7 @@ class LocalJobManagerTest
         assertThat(manager.activeJobs()).containsExactlyInAnyOrder(job1, job2);
 
         // Removing one operation's handle leaves the other intact
-        manager.removeJob(OPERATION_ID, NODE_ID_1);
+        assertThat(manager.removeJob(OPERATION_ID, NODE_ID_1, job1)).isTrue();
         assertThat(manager.getJob(OPERATION_ID, NODE_ID_1)).isNull();
         assertThat(manager.getJob(otherOperationId, NODE_ID_1)).isSameAs(job2);
     }

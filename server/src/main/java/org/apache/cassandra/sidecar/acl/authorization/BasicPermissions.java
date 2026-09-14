@@ -64,6 +64,7 @@ public class BasicPermissions
 
     // sidecar operation related permissions
     public static final Permission READ_OPERATIONAL_JOB = new DomainAwarePermission("OPERATIONAL_JOB:READ", OPERATION_SCOPE);
+    public static final Permission UPDATE_OPERATIONAL_JOB = new DomainAwarePermission("OPERATIONAL_JOB:UPDATE", OPERATION_SCOPE);
     public static final Permission DECOMMISSION_NODE = new DomainAwarePermission("NODE:DECOMMISSION", OPERATION_SCOPE);
     public static final Permission MOVE_NODE = new DomainAwarePermission("NODE:MOVE", OPERATION_SCOPE);
     public static final Permission REPAIR = new StandardPermission("REPAIR", OPERATION_SCOPE);

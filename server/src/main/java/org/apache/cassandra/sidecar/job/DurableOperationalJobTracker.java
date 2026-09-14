@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.sidecar.job;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -37,6 +38,9 @@ import com.google.inject.Singleton;
 import org.apache.cassandra.sidecar.common.data.OperationalJobStatus;
 import org.apache.cassandra.sidecar.concurrent.TaskExecutorPool;
 import org.apache.cassandra.sidecar.config.ServiceConfiguration;
+import org.apache.cassandra.sidecar.exceptions.OperationalJobConflictException;
+import org.apache.cassandra.sidecar.exceptions.OperationalJobNotCoordinatedException;
+import org.apache.cassandra.sidecar.exceptions.OperationalJobNotFoundException;
 import org.apache.cassandra.sidecar.job.storage.OperationalJobRecord;
 import org.apache.cassandra.sidecar.job.storage.StorageProvider;
 import org.apache.cassandra.sidecar.utils.InvocationTrackingFunction;
@@ -65,6 +69,7 @@ import org.jetbrains.annotations.Nullable;
 public class DurableOperationalJobTracker implements OperationalJobTracker
 {
     private static final Logger LOGGER = LoggerFactory.getLogger(DurableOperationalJobTracker.class);
+    private static final String OPERATOR_ABORT_REASON = "Aborted by operator request";
     private static final int MAX_STORAGE_WRITE_ATTEMPTS = 3;
     private static final long RETRY_DELAY_MS = 100;
     private static final long RETRY_JITTER_MS = 100;
@@ -213,6 +218,121 @@ public class DurableOperationalJobTracker implements OperationalJobTracker
     }
 
     /**
+     * {@inheritDoc}
+     *
+     * <p>The record is read from storage rather than from {@link #liveJobs}, because an in-process job reports
+     * the outcome of the local handoff rather than the state of the cluster-wide operation the abort acts on.</p>
+     */
+    @Override
+    public OperationalJobInfo markJobAsAborted(UUID jobId, boolean force)
+    {
+        OperationalJobRecord record = storageProvider.findJob(jobId);
+        if (record == null)
+        {
+            throw new OperationalJobNotFoundException("Unknown job with ID: " + jobId);
+        }
+
+        if (record.status() == OperationalJobStatus.SUCCEEDED || record.status() == OperationalJobStatus.FAILED)
+        {
+            throw new OperationalJobConflictException("Job " + jobId + " has already finished with status "
+                                                      + record.status() + " and cannot be aborted");
+        }
+
+        // Single-node jobs are persisted here too, and are told apart from coordinated cluster-wide operations by
+        // whether they recorded an execution order.
+        List<List<UUID>> nodeExecutionOrder = record.nodeExecutionOrder();
+        if (nodeExecutionOrder == null || nodeExecutionOrder.isEmpty())
+        {
+            throw new OperationalJobNotCoordinatedException(
+            "Job " + jobId + " is not a coordinated cluster-wide operation, so it holds no datacenter lock and has "
+            + "no per-node state to settle");
+        }
+
+        LOGGER.warn("Aborting operational job by request. jobId={} operationType={} priorStatus={} force={}",
+                    jobId, record.operationType(), record.status(), force);
+
+        storageProvider.updateJobStatus(jobId, record.operationType(), OperationalJobStatus.ABORTED,
+                                        OPERATOR_ABORT_REASON);
+
+        Map<UUID, OperationalJobStatus> nodeStatuses = storageProvider.getNodeStatusesForOperation(jobId);
+        if (force)
+        {
+            forceSettleOutstandingNodes(jobId, OperationalJobStatus.ABORTED, nodeExecutionOrder, nodeStatuses);
+        }
+        return abortedRecord(record, nodeStatuses);
+    }
+
+    /**
+     * Settles every node row that has not reached a terminal status, standing in for the Sidecars that cannot
+     * settle their own. {@link NodeSettlement} decides the status each node records, the same rule the Sidecar
+     * that owns a node applies to the rows it settles itself.
+     *
+     * <p><b>This writes rows this Sidecar does not own, so operators must know that the lock can be released while
+     * a job is still running when they send a force request.</b></p>
+     *
+     * <p>A node abandoned mid-execution gets no {@code onJobFailed} reconciliation, because the Sidecar that could
+     * run it is the one presumed unreachable. Those nodes are logged so the operator knows which ones they have
+     * taken responsibility for.</p>
+     */
+    private void forceSettleOutstandingNodes(UUID jobId,
+                                             OperationalJobStatus operationStatus,
+                                             List<List<UUID>> nodeExecutionOrder,
+                                             Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
+        List<UUID> abandonedMidExecution = new ArrayList<>();
+        List<UUID> neverStarted = new ArrayList<>();
+        for (List<UUID> group : nodeExecutionOrder)
+        {
+            for (UUID nodeId : group)
+            {
+                switch (NodeSettlement.of(nodeStatuses.get(nodeId)))
+                {
+                    case NOT_STARTED:
+                        neverStarted.add(nodeId);
+                        break;
+                    case ABANDONED_MID_EXECUTION:
+                        abandonedMidExecution.add(nodeId);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        settleAll(jobId, neverStarted, NodeSettlement.NOT_STARTED.terminalStatus(operationStatus), nodeStatuses);
+        settleAll(jobId, abandonedMidExecution,
+                  NodeSettlement.ABANDONED_MID_EXECUTION.terminalStatus(operationStatus), nodeStatuses);
+
+        LOGGER.warn("Forced abort settled node rows on behalf of the Sidecars that own them. jobId={} "
+                    + "neverStarted={} abandonedMidExecution={}. The nodes abandoned mid-execution were executing "
+                    + "when the operation was forced, and nothing will reconcile them; check them by hand.",
+                    jobId, neverStarted, abandonedMidExecution);
+    }
+
+    private void settleAll(UUID jobId, List<UUID> nodeIds, OperationalJobStatus status,
+                           Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
+        if (nodeIds.isEmpty())
+        {
+            return;
+        }
+        storageProvider.updateNodeStatuses(jobId, nodeIds, status);
+        nodeIds.forEach(nodeId -> nodeStatuses.put(nodeId, status));
+    }
+
+    /**
+     * The job as it stands once aborted, carrying the per-node breakdown so the caller sees how far the operation
+     * had got before it was given up on. A non-forced abort leaves the nodes it did not settle still pending or
+     * executing, and those are the ones the Sidecars that own them have yet to wind down.
+     */
+    private OperationalJobRecord abortedRecord(OperationalJobRecord record,
+                                               Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
+        return withNodeStatuses(record, OperationalJobStatus.ABORTED, Instant.now(), OPERATOR_ABORT_REASON,
+                                nodeStatuses);
+    }
+
+    /**
      * Seeds a {@link OperationalJobStatus#CREATED} row in node state storage for every node in the job's
      * execution order.
      */
@@ -243,7 +363,8 @@ public class DurableOperationalJobTracker implements OperationalJobTracker
         if (!record.nodesPending().isEmpty()
             || !record.nodesExecuting().isEmpty()
             || !record.nodesSucceeded().isEmpty()
-            || !record.nodesFailed().isEmpty())
+            || !record.nodesFailed().isEmpty()
+            || !record.nodesAborted().isEmpty())
         {
             return record;
         }
@@ -255,46 +376,43 @@ public class DurableOperationalJobTracker implements OperationalJobTracker
             return record;
         }
 
-        List<UUID> pending = new ArrayList<>();
-        List<UUID> executing = new ArrayList<>();
-        List<UUID> succeeded = new ArrayList<>();
-        List<UUID> failed = new ArrayList<>();
+        return withNodeStatuses(record, record.status(), record.lastUpdate(), record.failureReason(), nodeStatuses);
+    }
 
-        for (Map.Entry<UUID, OperationalJobStatus> entry : nodeStatuses.entrySet())
-        {
-            switch (entry.getValue())
-            {
-                case CREATED:
-                    pending.add(entry.getKey());
-                    break;
-                case RUNNING:
-                    executing.add(entry.getKey());
-                    break;
-                case SUCCEEDED:
-                    succeeded.add(entry.getKey());
-                    break;
-                case FAILED:
-                    failed.add(entry.getKey());
-                    break;
-                default:
-                    throw new IllegalStateException("Invalid state = " + entry.getValue());
-            }
-        }
-
+    /**
+     * Rebuilds a record with the per-node breakdown derived from {@code nodeStatuses}.
+     */
+    private static OperationalJobRecord withNodeStatuses(OperationalJobRecord record,
+                                                         OperationalJobStatus status,
+                                                         @Nullable Instant lastUpdate,
+                                                         @Nullable String failureReason,
+                                                         Map<UUID, OperationalJobStatus> nodeStatuses)
+    {
         return OperationalJobRecord.builder()
                                    .jobId(record.jobId())
                                    .operationType(record.operationType())
-                                   .status(record.status())
+                                   .status(status)
                                    .startTime(record.startTime())
-                                   .lastUpdate(record.lastUpdate())
-                                   .failureReason(record.failureReason())
+                                   .lastUpdate(lastUpdate)
+                                   .failureReason(failureReason)
                                    .nodeExecutionOrder(record.nodeExecutionOrder())
                                    .operationMetadata(record.operationMetadata())
-                                   .nodesPending(Collections.unmodifiableList(pending))
-                                   .nodesExecuting(Collections.unmodifiableList(executing))
-                                   .nodesSucceeded(Collections.unmodifiableList(succeeded))
-                                   .nodesFailed(Collections.unmodifiableList(failed))
+                                   .nodesPending(nodesWith(nodeStatuses, OperationalJobStatus.CREATED))
+                                   .nodesExecuting(nodesWith(nodeStatuses, OperationalJobStatus.RUNNING))
+                                   .nodesSucceeded(nodesWith(nodeStatuses, OperationalJobStatus.SUCCEEDED))
+                                   .nodesFailed(nodesWith(nodeStatuses, OperationalJobStatus.FAILED))
+                                   .nodesAborted(nodesWith(nodeStatuses, OperationalJobStatus.ABORTED))
                                    .build();
+    }
+
+    private static List<UUID> nodesWith(Map<UUID, OperationalJobStatus> nodeStatuses, OperationalJobStatus status)
+    {
+        return nodeStatuses.entrySet()
+                           .stream()
+                           .filter(entry -> entry.getValue() == status)
+                           .map(Map.Entry::getKey)
+                           .collect(Collectors.collectingAndThen(Collectors.toList(),
+                                                                 Collections::unmodifiableList));
     }
 
     /**

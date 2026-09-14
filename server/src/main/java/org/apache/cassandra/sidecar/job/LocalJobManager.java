@@ -90,14 +90,18 @@ public class LocalJobManager
     }
 
     /**
-     * Remove a completed job from tracking.
+     * Remove a job from tracking, only if it is still the tracked one. {@link #submitJob} hands back a succeeded
+     * future without executing when a node is already tracked, so a caller completing on that future would
+     * otherwise drop the handle of the job that is genuinely running.
      *
      * @param operationId the cluster-wide operation identifier
      * @param nodeId      the node whose job should be removed
+     * @param expected    the job the caller is finished with
+     * @return whether the job was removed
      */
-    public void removeJob(UUID operationId, UUID nodeId)
+    public boolean removeJob(UUID operationId, UUID nodeId, LocalJob expected)
     {
-        activeJobs.remove(new OperationNodeKey(operationId, nodeId));
+        return activeJobs.remove(new OperationNodeKey(operationId, nodeId), expected);
     }
 
     /**

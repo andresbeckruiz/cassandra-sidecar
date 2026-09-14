@@ -173,32 +173,52 @@ public class RestartJob extends LocalJob
 
     /**
      * Best-effort reconciliation invoked when the cluster-wide job terminates as FAILED: if this node was left
-     * stopped, it attempts to start it back up. This is not guaranteed to succeed — any failure is logged and
-     * swallowed, and the returned future always succeeds so it never blocks the coordinator's cleanup.
+     * stopped, or is on its way to being stopped, it attempts to start it back up. Failures are logged and
+     * swallowed and the returned future succeeds; the one exception is an interrupt, which abandons recovery
+     * and is surfaced by the coordinator.
+     *
+     * <p>The decision is made on the recorded <em>intent</em>, not only on the live process probe.
+     * {@code currentState} is computed by asking the lifecycle provider whether the process is running, so a node
+     * whose stop is still converging still reads {@code RUNNING}.
+     *
+     * <p>The lifecycle manager rejects a start while that stop is still in flight, so the conflict is retried
+     * within the transition timeout rather than abandoned.
      */
     @Override
     public Future<Void> onJobFailed()
     {
-        try
+        long deadline = System.currentTimeMillis() + nodeStateTransitionTimeout.toMillis();
+        while (System.currentTimeMillis() < deadline)
         {
-            LifecycleInfoResponse info = lifecycleManager.getLifecycleInfo(instanceHost());
-            if (!info.currentState().isRunning())
+            try
             {
-                LOGGER.info("Node {} is not running after job failure; attempting to start. operationId={}",
-                            nodeId(), operationId());
+                LifecycleInfoResponse info = lifecycleManager.getLifecycleInfo(instanceHost());
+                if (info.desiredState() != CassandraState.STOPPED && info.currentState().isRunning())
+                {
+                    return Future.succeededFuture();
+                }
+                LOGGER.info("Node {} is stopped or stopping after job failure; attempting to start. "
+                            + "currentState={} desiredState={} operationId={}",
+                            nodeId(), info.currentState(), info.desiredState(), operationId());
                 lifecycleManager.updateDesiredState(instanceHost(), CassandraState.RUNNING);
+                return Future.succeededFuture();
             }
+            catch (LifecycleTaskConflictException e)
+            {
+                LOGGER.debug("Lifecycle task conflict during onJobFailed recovery, will retry. operationId={}",
+                             operationId());
+            }
+            catch (Exception e)
+            {
+                LOGGER.warn("Failed to restart node {} during onJobFailed recovery. operationId={}",
+                            nodeId(), operationId(), e);
+                return Future.succeededFuture();
+            }
+
+            sleep(lifecyclePollIntervalMs);
         }
-        catch (LifecycleTaskConflictException e)
-        {
-            LOGGER.warn("Lifecycle task conflict during onJobFailed recovery for node {}. operationId={}",
-                        nodeId(), operationId(), e);
-        }
-        catch (Exception e)
-        {
-            LOGGER.warn("Failed to restart node {} during onJobFailed recovery. operationId={}",
-                        nodeId(), operationId(), e);
-        }
+        LOGGER.warn("Gave up starting node {} during onJobFailed recovery after {}; the node may still be down. "
+                    + "operationId={}", nodeId(), nodeStateTransitionTimeout, operationId());
         return Future.succeededFuture();
     }
 
@@ -250,6 +270,11 @@ public class RestartJob extends LocalJob
      * a previous transition's async cleanup hasn't completed yet by retrying the state request
      * within the overall timeout.
      *
+     * <p>Cancellation occurs only while the node is untouched and only when stopping it. A stop that has
+     * already been requested is seen through to convergence, because abandoning it here does not un-request it. 
+     * A start is never abandoned for a similar reason: the node is down, and finishing is the only thing that 
+     * makes it healthy again.
+     *
      * @param desiredState the target state (STOPPED or RUNNING)
      * @return true if the transition converged within the timeout, false otherwise
      */
@@ -263,8 +288,10 @@ public class RestartJob extends LocalJob
 
         while (System.currentTimeMillis() < deadline)
         {
-            if (isCancelled())
+            if (desiredState == CassandraState.STOPPED && !transitionRequested && isCancelled())
             {
+                LOGGER.info("Restart cancelled before node {} was stopped; leaving node RUNNING. operationId={}",
+                            nodeId(), operationId());
                 return false;
             }
             if (!transitionRequested)

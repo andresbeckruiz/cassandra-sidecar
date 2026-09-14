@@ -28,8 +28,6 @@ import org.apache.cassandra.sidecar.common.response.OperationalJobResponse;
 import org.apache.cassandra.sidecar.exceptions.OperationalJobConflictException;
 import org.apache.cassandra.sidecar.job.OperationalJobInfo;
 
-import static org.apache.cassandra.sidecar.common.data.OperationalJobStatus.FAILED;
-
 /**
  * Utility class for OperationalJob framework operations.
  */
@@ -64,6 +62,7 @@ public class OperationalJobUtils
                                                .nodesExecuting(job.nodesExecuting())
                                                .nodesSucceeded(job.nodesSucceeded())
                                                .nodesFailed(job.nodesFailed())
+                                               .nodesAborted(job.nodesAborted())
                                                .lastUpdate(job.lastUpdate())
                                                .build());
             return;
@@ -81,7 +80,7 @@ public class OperationalJobUtils
         }
 
         String reason = null;
-        if (status == FAILED)
+        if (status.isUnsuccessful())
         {
             reason = job.failureReason();
         }
@@ -95,6 +94,7 @@ public class OperationalJobUtils
                                            .nodesExecuting(job.nodesExecuting())
                                            .nodesSucceeded(job.nodesSucceeded())
                                            .nodesFailed(job.nodesFailed())
+                                           .nodesAborted(job.nodesAborted())
                                            .lastUpdate(job.lastUpdate())
                                            .build());
     }

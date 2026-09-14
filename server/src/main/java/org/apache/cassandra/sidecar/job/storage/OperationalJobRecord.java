@@ -65,6 +65,8 @@ public class OperationalJobRecord implements OperationalJobInfo
     private final List<UUID> nodesSucceeded;
     @NotNull
     private final List<UUID> nodesFailed;
+    @NotNull
+    private final List<UUID> nodesAborted;
 
     /**
      * Constructs an OperationalJobRecord from its {@link Builder}.
@@ -90,6 +92,7 @@ public class OperationalJobRecord implements OperationalJobInfo
         nodesExecuting = builder.nodesExecuting;
         nodesSucceeded = builder.nodesSucceeded;
         nodesFailed = builder.nodesFailed;
+        nodesAborted = builder.nodesAborted;
     }
 
     /**
@@ -217,6 +220,13 @@ public class OperationalJobRecord implements OperationalJobInfo
     }
 
     @Override
+    @NotNull
+    public List<UUID> nodesAborted()
+    {
+        return nodesAborted;
+    }
+
+    @Override
     public boolean isExecuting()
     {
         return status == OperationalJobStatus.RUNNING;
@@ -258,6 +268,7 @@ public class OperationalJobRecord implements OperationalJobInfo
                ", nodesExecuting=" + nodesExecuting +
                ", nodesSucceeded=" + nodesSucceeded +
                ", nodesFailed=" + nodesFailed +
+               ", nodesAborted=" + nodesAborted +
                '}';
     }
 
@@ -286,6 +297,7 @@ public class OperationalJobRecord implements OperationalJobInfo
         private @NotNull List<UUID> nodesExecuting = Collections.emptyList();
         private @NotNull List<UUID> nodesSucceeded = Collections.emptyList();
         private @NotNull List<UUID> nodesFailed = Collections.emptyList();
+        private @NotNull List<UUID> nodesAborted = Collections.emptyList();
 
         private Builder()
         {
@@ -355,6 +367,11 @@ public class OperationalJobRecord implements OperationalJobInfo
         public Builder nodesFailed(@NotNull List<UUID> nodesFailed)
         {
             return update(b -> b.nodesFailed = Objects.requireNonNull(nodesFailed, "nodesFailed cannot be null"));
+        }
+
+        public Builder nodesAborted(@NotNull List<UUID> nodesAborted)
+        {
+            return update(b -> b.nodesAborted = Objects.requireNonNull(nodesAborted, "nodesAborted cannot be null"));
         }
 
         public OperationalJobRecord build()

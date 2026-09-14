@@ -39,10 +39,25 @@ public enum OperationalJobStatus
     /**
      * The operational job fails
      */
-    FAILED;
+    FAILED,
+    /**
+     * The operational job was stopped by an operator before it could finish.
+     */
+    ABORTED;
 
+    /**
+     * @return {@code true} if this is a terminal status, i.e. no further transition follows it
+     */
     public boolean isCompleted()
     {
-        return this == SUCCEEDED || this == FAILED;
+        return this == SUCCEEDED || this == FAILED || this == ABORTED;
+    }
+
+    /**
+     * @return {@code true} if this is a terminal status other than {@link #SUCCEEDED}
+     */
+    public boolean isUnsuccessful()
+    {
+        return isCompleted() && this != SUCCEEDED;
     }
 }

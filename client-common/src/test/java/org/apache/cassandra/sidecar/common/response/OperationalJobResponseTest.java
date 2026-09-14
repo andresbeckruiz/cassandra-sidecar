@@ -90,27 +90,40 @@ class OperationalJobResponseTest
         Instant startTime = Instant.parse("2026-05-12T14:30:00Z");
         Instant lastUpdate = Instant.parse("2026-05-12T14:35:00Z");
         UUID jobId = UUID.randomUUID();
-        UUID nodeId = UUID.randomUUID();
-        List<UUID> nodesSucceeded = Arrays.asList(nodeId);
+        List<UUID> nodesPending = Arrays.asList(UUID.randomUUID());
+        List<UUID> nodesExecuting = Arrays.asList(UUID.randomUUID());
+        List<UUID> nodesSucceeded = Arrays.asList(UUID.randomUUID());
+        List<UUID> nodesFailed = Arrays.asList(UUID.randomUUID());
+        List<UUID> nodesAborted = Arrays.asList(UUID.randomUUID());
 
         OperationalJobResponse original = OperationalJobResponse.builder()
                                                                  .jobId(jobId)
-                                                                 .status(OperationalJobStatus.SUCCEEDED)
+                                                                 .status(OperationalJobStatus.ABORTED)
                                                                  .operation("decommission")
+                                                                 .reason("Aborted by operator request")
                                                                  .startTime(startTime)
                                                                  .lastUpdate(lastUpdate)
+                                                                 .nodesPending(nodesPending)
+                                                                 .nodesExecuting(nodesExecuting)
                                                                  .nodesSucceeded(nodesSucceeded)
+                                                                 .nodesFailed(nodesFailed)
+                                                                 .nodesAborted(nodesAborted)
                                                                  .build();
 
         String json = objectMapper.writeValueAsString(original);
         OperationalJobResponse deserialized = objectMapper.readValue(json, OperationalJobResponse.class);
 
         assertThat(deserialized.jobId()).isEqualTo(jobId);
-        assertThat(deserialized.status()).isEqualTo(OperationalJobStatus.SUCCEEDED);
+        assertThat(deserialized.status()).isEqualTo(OperationalJobStatus.ABORTED);
         assertThat(deserialized.operation()).isEqualTo("decommission");
+        assertThat(deserialized.reason()).isEqualTo("Aborted by operator request");
         assertThat(deserialized.startTime()).isEqualTo(startTime);
         assertThat(deserialized.lastUpdate()).isEqualTo(lastUpdate);
+        assertThat(deserialized.nodesPending()).isEqualTo(nodesPending);
+        assertThat(deserialized.nodesExecuting()).isEqualTo(nodesExecuting);
         assertThat(deserialized.nodesSucceeded()).isEqualTo(nodesSucceeded);
+        assertThat(deserialized.nodesFailed()).isEqualTo(nodesFailed);
+        assertThat(deserialized.nodesAborted()).isEqualTo(nodesAborted);
     }
 
     @Test

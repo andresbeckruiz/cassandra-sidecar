@@ -264,6 +264,48 @@ class RestartJobTest
     }
 
     @Test
+    void testOnJobFailedStartsNodeWhoseStopHasNotConvergedYet() throws Exception
+    {
+        when(lifecycleManager.getLifecycleInfo(instanceHost))
+            .thenReturn(new LifecycleInfoResponse(CassandraState.RUNNING, CassandraState.STOPPED,
+                                                  OperationStatus.CONVERGING, "test"));
+
+        RestartJob job = createJob();
+        job.onJobFailed();
+
+        verify(lifecycleManager).updateDesiredState(eq(instanceHost), eq(CassandraState.RUNNING));
+    }
+
+    @Test
+    void testOnJobFailedRetriesWhileTheStopItIsRecoveringFromIsStillInFlight() throws Exception
+    {
+        when(lifecycleManager.getLifecycleInfo(instanceHost))
+            .thenReturn(new LifecycleInfoResponse(CassandraState.STOPPED, CassandraState.STOPPED,
+                                                  OperationStatus.CONVERGED, "test"));
+        // The lifecycle manager admits one task per host at a time, so the start is rejected until the stop's
+        // async cleanup completes. Giving up on the first conflict would leave the node down.
+        AtomicInteger attempts = new AtomicInteger();
+        when(lifecycleManager.updateDesiredState(eq(instanceHost), eq(CassandraState.RUNNING)))
+            .thenAnswer(inv -> {
+                if (attempts.incrementAndGet() < 3)
+                {
+                    throw new LifecycleTaskConflictException("Task already in progress for this host.");
+                }
+                return new LifecycleInfoResponse(CassandraState.RUNNING, CassandraState.RUNNING,
+                                                 OperationStatus.CONVERGING, "test");
+            });
+
+        RestartJob job = createJob();
+        job.onJobFailed();
+
+        assertThat(attempts.get())
+        .describedAs("recovery must retry the conflict rather than abandon the node")
+        .isEqualTo(3);
+        verify(lifecycleManager, times(3)).updateDesiredState(eq(instanceHost), eq(CassandraState.RUNNING));
+    }
+
+
+    @Test
     void testCancelBeforeExecuteSkipsAllWork() throws Exception
     {
         stubLifecycle(CassandraState.RUNNING);
@@ -279,6 +321,90 @@ class RestartJobTest
         }
         assertThat(job.status()).isEqualTo(OperationalJobStatus.FAILED);
         verify(lifecycleManager, never()).updateDesiredState(any(), any());
+    }
+
+    @Test
+    void testCancelWhileStoppingStillBringsTheNodeBackUp() throws Exception
+    {
+        stubLifecycle(CassandraState.RUNNING);
+        when(healthChecker.isHealthy(any(), eq(nodeId))).thenReturn(true);
+
+        RestartJob job = createJob();
+        when(lifecycleManager.updateDesiredState(eq(instanceHost), eq(CassandraState.STOPPED)))
+            .thenAnswer(inv -> {
+                converge(CassandraState.STOPPED);
+                job.cancel();
+                return info();
+            });
+
+        job.execute();
+
+        assertThat(job.status())
+        .describedAs("a restart cancelled mid-stop must run to completion rather than strand the node")
+        .isEqualTo(OperationalJobStatus.SUCCEEDED);
+        verify(lifecycleManager).updateDesiredState(eq(instanceHost), eq(CassandraState.RUNNING));
+        assertThat(currentState.get()).isEqualTo(CassandraState.RUNNING);
+    }
+
+    @Test
+    void testCancelWhileStartingStillBringsTheNodeBackUp() throws Exception
+    {
+        stubLifecycle(CassandraState.RUNNING);
+        when(healthChecker.isHealthy(any(), eq(nodeId))).thenReturn(true);
+
+        RestartJob job = createJob();
+        AtomicInteger pollsSinceStartRequested = new AtomicInteger(-1);
+        when(lifecycleManager.getLifecycleInfo(instanceHost)).thenAnswer(inv -> {
+            if (pollsSinceStartRequested.get() >= 0 && pollsSinceStartRequested.incrementAndGet() >= 2)
+            {
+                currentState.set(CassandraState.RUNNING);
+            }
+            return info();
+        });
+        when(lifecycleManager.updateDesiredState(eq(instanceHost), eq(CassandraState.STOPPED)))
+            .thenAnswer(inv -> {
+                converge(CassandraState.STOPPED);
+                return info();
+            });
+        when(lifecycleManager.updateDesiredState(eq(instanceHost), eq(CassandraState.RUNNING)))
+            .thenAnswer(inv -> {
+                desiredState.set(CassandraState.RUNNING);
+                pollsSinceStartRequested.set(0);
+                job.cancel();
+                return info();
+            });
+
+        job.execute();
+
+        assertThat(job.status()).isEqualTo(OperationalJobStatus.SUCCEEDED);
+        assertThat(currentState.get()).isEqualTo(CassandraState.RUNNING);
+    }
+
+    @Test
+    void testCancelBeforeTheStopIsRequestedLeavesTheNodeRunning() throws Exception
+    {
+        stubLifecycle(CassandraState.RUNNING);
+
+        RestartJob job = createJob();
+        // Cancelled after the health check passes but before the stop is requested: the node has not been
+        // touched, so the restart must abandon rather than take it down.
+        when(healthChecker.isHealthy(any(), eq(nodeId))).thenAnswer(inv -> {
+            job.cancel();
+            return true;
+        });
+        try
+        {
+            job.execute();
+        }
+        catch (Exception ignored)
+        {
+        }
+
+        assertThat(job.status()).isEqualTo(OperationalJobStatus.FAILED);
+        verify(lifecycleManager, never()).updateDesiredState(any(), eq(CassandraState.STOPPED));
+        assertThat(currentState.get())
+        .describedAs("a node that was never stopped must be left running")
+        .isEqualTo(CassandraState.RUNNING);
     }
 
     @Test
