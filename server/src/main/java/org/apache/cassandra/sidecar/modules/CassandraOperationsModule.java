@@ -26,6 +26,7 @@ import com.google.inject.Provides;
 import com.google.inject.Singleton;
 import com.google.inject.multibindings.ProvidesIntoMap;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.POST;
 import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import org.apache.cassandra.sidecar.adapters.base.db.schema.ConnectedClientsSchema;
@@ -64,6 +65,7 @@ import org.apache.cassandra.sidecar.handlers.NodeMoveHandler;
 import org.apache.cassandra.sidecar.handlers.OperationalJobHandler;
 import org.apache.cassandra.sidecar.handlers.RepairHandler;
 import org.apache.cassandra.sidecar.handlers.RingHandler;
+import org.apache.cassandra.sidecar.handlers.RollingRestartHandler;
 import org.apache.cassandra.sidecar.handlers.SchemaHandler;
 import org.apache.cassandra.sidecar.handlers.StreamStatsHandler;
 import org.apache.cassandra.sidecar.handlers.TableStatsHandler;
@@ -400,6 +402,35 @@ public class CassandraOperationsModule extends AbstractModule
         return factory.builderForRoute()
                       .setBodyHandler(true)
                       .handler(nodeMoveHandler)
+                      .build();
+    }
+
+    @POST
+    @Path(ApiEndpointsV1.RESTART_OPERATION_ROUTE)
+    @Operation(summary = "Create a rolling restart job",
+               description = "Creates a rolling restart job for the specified datacenter")
+    @APIResponse(description = "Rolling restart job initiated successfully",
+                 responseCode = "202",
+                 content = @Content(mediaType = "application/json",
+                 schema = @Schema(implementation = OperationalJobResponse.class)))
+    @APIResponse(description = "Conflicting rolling restart job encountered",
+                 responseCode = "409",
+                 content = @Content(mediaType = "application/json",
+                 schema = @Schema(implementation = OperationalJobResponse.class)))
+    @APIResponse(responseCode = "400",
+                 description = "Invalid request - malformed JSON body or invalid parameters")
+    @APIResponse(responseCode = "503",
+                 description = "Rolling restart feature is not enabled")
+    @APIResponse(responseCode = "500",
+                 description = "Internal server error while retrieving the ring topology")
+    @ProvidesIntoMap
+    @KeyClassMapKey(VertxRouteMapKeys.CassandraRestartOperationRouteKey.class)
+    VertxRoute cassandraRestartOperationRoute(RouteBuilder.Factory factory,
+                                              RollingRestartHandler rollingRestartHandler)
+    {
+        return factory.builderForRoute()
+                      .setBodyHandler(true)
+                      .handler(rollingRestartHandler)
                       .build();
     }
 

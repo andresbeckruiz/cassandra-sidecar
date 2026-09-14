@@ -150,6 +150,7 @@ public final class ApiEndpointsV1
     public static final String STREAM_STATS_ROUTE = API_V1 + CASSANDRA + "/stats/streams";
     public static final String TABLE_STATS_ROUTE = API_V1 + CASSANDRA + PER_KEYSPACE + PER_TABLE + "/stats";
     public static final String COMPACTION_STOP_ROUTE = API_V1 + CASSANDRA + OPERATION_ROUTE + "/compaction/stop";
+    public static final String RESTART_OPERATION_ROUTE = API_V1 + CASSANDRA + "/operations/restart";
     public static final String REPAIR_ROUTE = API_V1 + CASSANDRA + PER_KEYSPACE + "/repair";
 
 

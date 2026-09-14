@@ -114,6 +114,11 @@ public interface VertxRouteMapKeys
         HttpMethod HTTP_METHOD = HttpMethod.GET;
         String ROUTE_URI = ApiEndpointsV1.NODE_SETTINGS_ROUTE;
     }
+    interface CassandraRestartOperationRouteKey extends RouteClassKey
+    {
+        HttpMethod HTTP_METHOD = HttpMethod.POST;
+        String ROUTE_URI = ApiEndpointsV1.RESTART_OPERATION_ROUTE;
+    }
     interface CassandraOperationalJobRouteKey extends RouteClassKey
     {
         HttpMethod HTTP_METHOD = HttpMethod.GET;

@@ -68,6 +68,7 @@ public class BasicPermissions
     public static final Permission MOVE_NODE = new DomainAwarePermission("NODE:MOVE", OPERATION_SCOPE);
     public static final Permission REPAIR = new StandardPermission("REPAIR", OPERATION_SCOPE);
     public static final Permission DRAIN_NODE = new DomainAwarePermission("NODE:DRAIN", OPERATION_SCOPE);
+    public static final Permission RESTART = new StandardPermission("RESTART", OPERATION_SCOPE);
 
     // Permissions related to Schema Reporting
     public static final Permission REPORT_SCHEMA = new DomainAwarePermission("SCHEMA:PUBLISH", CLUSTER_SCOPE);
