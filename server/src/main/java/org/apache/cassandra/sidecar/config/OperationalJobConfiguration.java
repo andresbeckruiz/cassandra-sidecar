@@ -29,4 +29,29 @@ public interface OperationalJobConfiguration
      * @return the time-to-live for operational job tables
      */
     SecondBoundConfiguration tablesTtl();
+
+    /**
+     * @return whether operational job coordination is enabled for this Sidecar instance. When {@code true}, a
+     * storage-backed coordinator enforces mutual exclusion for coordinated cluster-wide operations and the local
+     * coordinator drives this Sidecar's per-node job execution; when {@code false}, coordination is disabled and
+     * coordinated operations are rejected.
+     */
+    boolean coordinationEnabled();
+
+    /**
+     * @return whether operational jobs are tracked durably in Cassandra-backed storage. When {@code false}
+     * (the default), jobs are tracked in memory only. Enable to persist job state across Sidecar restarts;
+     * this requires the Sidecar operational-job schema to be available.
+     */
+    boolean durableTrackingEnabled();
+
+    /**
+     * @return the polling interval for the local job coordinator
+     */
+    SecondBoundConfiguration localJobCoordinationDelay();
+
+    /**
+     * @return the maximum time a node's local job may execute before it is marked failed
+     */
+    SecondBoundConfiguration nodeExecutionTimeout();
 }

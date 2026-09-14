@@ -460,6 +460,19 @@ blob_restore:
   slow_task_report_delay: 1m
   ring_topology_refresh_delay: 1m
 
+operational_job:
+  # TTL applied to the operational job tracking tables (cluster_ops, cluster_ops_node_state, active_cluster_ops)
+  tables_ttl: 90d
+  # Enables job coordination: the operational job coordinator (active operation lock, per operation type per DC)
+  # and the local coordinator periodic task that drives this Sidecar's per-node local job execution
+  coordination_enabled: false
+  # Polling interval for the local coordinator
+  local_job_coordination_delay: 3m
+  # Max time a node's local job will execute before marked as failed
+  node_execution_timeout: 10m
+  # Uses the durable job tracker when true, otherwise the in-memory tracker
+  durable_tracking_enabled: false
+
 s3_client:
   concurrency: 4
   thread_name_prefix: s3-client

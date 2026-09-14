@@ -70,4 +70,18 @@ public interface OperationalJobTracker
      */
     @NotNull
     List<OperationalJob> inflightJobsByOperation(String operation);
+
+    /**
+     * Returns a snapshot of all inflight (CREATED or RUNNING) jobs tracked by this Sidecar.
+     * <p>
+     * Unlike {@link #jobsView()}, which exposes only the in-process live map, durable 
+     * implementations also merge in still-active jobs reconstructed from storage. This surfaces
+     * coordinated jobs (e.g. rolling restart) that are evicted from the in-process map almost
+     * immediately after handoff but are long running. The storage-backed portion is scoped 
+     * to the local datacenter.
+     *
+     * @return list of inflight job info, never null
+     */
+    @NotNull
+    List<OperationalJobInfo> inflightJobs();
 }

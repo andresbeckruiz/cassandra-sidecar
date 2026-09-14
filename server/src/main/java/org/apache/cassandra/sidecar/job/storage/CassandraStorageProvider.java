@@ -18,22 +18,25 @@
 
 package org.apache.cassandra.sidecar.job.storage;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
 
-import com.datastax.driver.core.Host;
-import com.datastax.driver.core.Session;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.datastax.driver.core.exceptions.DriverException;
 import org.apache.cassandra.sidecar.common.data.OperationType;
 import org.apache.cassandra.sidecar.common.data.OperationalJobStatus;
+import org.apache.cassandra.sidecar.common.response.NodeSettings;
 import org.apache.cassandra.sidecar.common.server.CQLSessionProvider;
+import org.apache.cassandra.sidecar.config.DriverConfiguration;
 import org.apache.cassandra.sidecar.db.ActiveClusterOpsDatabaseAccessor;
 import org.apache.cassandra.sidecar.db.ClusterOpsDatabaseAccessor;
 import org.apache.cassandra.sidecar.db.ClusterOpsNodeStateDatabaseAccessor;
 import org.apache.cassandra.sidecar.exceptions.CassandraUnavailableException;
+import org.apache.cassandra.sidecar.utils.InstanceMetadataFetcher;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -44,10 +47,14 @@ import org.jetbrains.annotations.Nullable;
  */
 public class CassandraStorageProvider implements StorageProvider
 {
+    private static final Logger LOGGER = LoggerFactory.getLogger(CassandraStorageProvider.class);
+
     private final CQLSessionProvider sessionProvider;
     private final ClusterOpsDatabaseAccessor clusterOpsAccessor;
     private final ClusterOpsNodeStateDatabaseAccessor nodeStateAccessor;
     private final ActiveClusterOpsDatabaseAccessor activeOpsAccessor;
+    private final InstanceMetadataFetcher instanceMetadataFetcher;
+    private final DriverConfiguration driverConfiguration;
     private volatile String clusterName;
     private volatile String datacenter;
 
@@ -61,12 +68,16 @@ public class CassandraStorageProvider implements StorageProvider
                                     ClusterOpsDatabaseAccessor clusterOpsAccessor,
                                     ClusterOpsNodeStateDatabaseAccessor nodeStateAccessor,
                                     ActiveClusterOpsDatabaseAccessor activeOpsAccessor,
+                                    InstanceMetadataFetcher instanceMetadataFetcher,
+                                    DriverConfiguration driverConfiguration,
                                     @Nullable String clusterName)
     {
         this.sessionProvider = sessionProvider;
         this.clusterOpsAccessor = clusterOpsAccessor;
         this.nodeStateAccessor = nodeStateAccessor;
         this.activeOpsAccessor = activeOpsAccessor;
+        this.instanceMetadataFetcher = instanceMetadataFetcher;
+        this.driverConfiguration = driverConfiguration;
         this.clusterName = clusterName;
     }
 
@@ -104,11 +115,15 @@ public class CassandraStorageProvider implements StorageProvider
     }
 
     @Override
-    public boolean trySetActiveOperation(OperationType operationType, UUID operationId)
+    public boolean trySetActiveOperation(OperationType operationType, UUID operationId,
+                                         @Nullable String targetDatacenter)
     {
         return execute("trySetActiveOperation",
-                       () -> activeOpsAccessor.trySetActiveOperation(clusterName, datacenter,
-                                                                     operationType, operationId));
+                       () -> {
+                           String dc = targetDatacenter != null ? targetDatacenter : datacenter;
+                           return activeOpsAccessor.trySetActiveOperation(clusterName, dc,
+                                                                          operationType, operationId);
+                       });
     }
 
     @Override
@@ -128,11 +143,15 @@ public class CassandraStorageProvider implements StorageProvider
     }
 
     @Override
-    public boolean clearActiveOperation(OperationType operationType, UUID operationId)
+    public boolean clearActiveOperation(OperationType operationType, UUID operationId,
+                                        @Nullable String targetDatacenter)
     {
         return execute("clearActiveOperation",
-                       () -> activeOpsAccessor.clearActiveOperation(clusterName, datacenter,
-                                                                    operationType, operationId));
+                       () -> {
+                           String dc = targetDatacenter != null ? targetDatacenter : datacenter;
+                           return activeOpsAccessor.clearActiveOperation(clusterName, dc,
+                                                                         operationType, operationId);
+                       });
     }
 
     @Override
@@ -176,26 +195,56 @@ public class CassandraStorageProvider implements StorageProvider
         // TTL on all tables handles record pruning.
         try
         {
-            Session session = sessionProvider.get();
             if (clusterName == null)
             {
-                clusterName = session.getCluster().getMetadata().getClusterName();
+                clusterName = sessionProvider.get().getCluster().getMetadata().getClusterName();
             }
             if (datacenter == null)
             {
-                Collection<Host> connectedHosts = session.getState().getConnectedHosts();
-                if (connectedHosts.isEmpty())
-                {
-                    throw new StorageProviderException(
-                    "Failed to resolve local datacenter: no connected hosts available");
-                }
-                datacenter = connectedHosts.iterator().next().getDatacenter();
+                datacenter = resolveLocalDatacenter();
             }
         }
         catch (CassandraUnavailableException e)
         {
             throw new StorageProviderException("Failed to initialize storage provider", e);
         }
+    }
+
+    /**
+     * Resolves this Sidecar's local datacenter. Resolution prefers the managed instance's own datacenter 
+     * (authoritative on Cassandra 4.x+), then falls back to the operator-configured driver {@code local_dc}
+     * A datacenter is mandatory: if neither source yields one, initialization fails.
+     */
+    @NotNull
+    private String resolveLocalDatacenter()
+    {
+        try
+        {
+            NodeSettings nodeSettings = instanceMetadataFetcher.callOnFirstAvailableInstance(
+            instance -> instance.delegate().nodeSettings());
+            String nodeSettingsDatacenter = nodeSettings.datacenter();
+            if (nodeSettingsDatacenter != null && !nodeSettingsDatacenter.isEmpty())
+            {
+                return nodeSettingsDatacenter;
+            }
+            LOGGER.debug("Local datacenter absent from node settings; falling back to configured driver local_dc");
+        }
+        catch (Exception e)
+        {
+            LOGGER.debug("Could not resolve local datacenter from node settings; " +
+                         "falling back to configured driver local_dc", e);
+        }
+
+        String configuredDatacenter = driverConfiguration.localDc();
+        if (configuredDatacenter != null && !configuredDatacenter.isEmpty())
+        {
+            return configuredDatacenter;
+        }
+
+        String message = "Failed to resolve local datacenter for operational job coordination: node settings did "
+                         + "not provide a datacenter and driver local_dc is not configured";
+        LOGGER.error(message);
+        throw new StorageProviderException(message);
     }
 
     @Override
@@ -216,7 +265,7 @@ public class CassandraStorageProvider implements StorageProvider
     {
         if (clusterName == null || datacenter == null)
         {
-            throw new StorageProviderException("StorageProvider has not been initialized. Call initialize() first.");
+            initialize();
         }
         try
         {

@@ -35,6 +35,7 @@ import org.apache.cassandra.sidecar.job.storage.CassandraStorageProvider;
 import org.apache.cassandra.sidecar.job.storage.StorageProvider;
 import org.apache.cassandra.sidecar.modules.multibindings.KeyClassMapKey;
 import org.apache.cassandra.sidecar.modules.multibindings.TableSchemaMapKeys;
+import org.apache.cassandra.sidecar.utils.InstanceMetadataFetcher;
 
 /**
  * Guice module for operational job storage, providing schema registrations
@@ -71,9 +72,12 @@ public class OperationalJobsModule extends AbstractModule
     StorageProvider cassandraStorageProvider(CQLSessionProvider sessionProvider,
                                             ClusterOpsDatabaseAccessor clusterOpsAccessor,
                                             ClusterOpsNodeStateDatabaseAccessor nodeStateAccessor,
-                                            ActiveClusterOpsDatabaseAccessor activeOpsAccessor)
+                                            ActiveClusterOpsDatabaseAccessor activeOpsAccessor,
+                                            InstanceMetadataFetcher instanceMetadataFetcher,
+                                            SidecarConfiguration configuration)
     {
-        return new CassandraStorageProvider(sessionProvider,
-                                            clusterOpsAccessor, nodeStateAccessor, activeOpsAccessor, null);
+        return new CassandraStorageProvider(sessionProvider, clusterOpsAccessor, nodeStateAccessor,
+                                            activeOpsAccessor, instanceMetadataFetcher,
+                                            configuration.driverConfiguration(), null);
     }
 }

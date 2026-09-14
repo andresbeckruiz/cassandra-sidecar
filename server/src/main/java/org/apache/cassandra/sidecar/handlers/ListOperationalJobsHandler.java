@@ -68,22 +68,28 @@ public class ListOperationalJobsHandler extends AbstractHandler<Void> implements
     @Override
     protected void handleInternal(RoutingContext context, HttpServerRequest httpRequest, @NotNull String host, SocketAddress remoteAddress, Void request)
     {
-        ListOperationalJobsResponse listResponse = new ListOperationalJobsResponse();
-        jobManager.allInflightJobs()
-                  .stream()
-                  .map(job -> OperationalJobResponse.builder()
-                                                    .jobId(job.jobId())
-                                                    .status(job.status())
-                                                    .operation(job.name())
-                                                    .startTime(job.startTime())
-                                                    .nodesPending(job.nodesPending())
-                                                    .nodesExecuting(job.nodesExecuting())
-                                                    .nodesSucceeded(job.nodesSucceeded())
-                                                    .nodesFailed(job.nodesFailed())
-                                                    .lastUpdate(job.lastUpdate())
-                                                    .build()
-                  )
-                  .forEach(listResponse::addJob);
-        context.json(listResponse);
+        // allInflightJobs() may perform blocking storage I/O (durable tracker merges in active operations
+        // from storage), so it must run off the event loop.
+        executorPools.service()
+                     .executeBlocking(jobManager::allInflightJobs)
+                     .onFailure(cause -> processFailure(cause, context, host, remoteAddress, request))
+                     .onSuccess(jobs -> {
+                         ListOperationalJobsResponse listResponse = new ListOperationalJobsResponse();
+                         jobs.stream()
+                             .map(job -> OperationalJobResponse.builder()
+                                                               .jobId(job.jobId())
+                                                               .status(job.status())
+                                                               .operation(job.name())
+                                                               .startTime(job.startTime())
+                                                               .nodesPending(job.nodesPending())
+                                                               .nodesExecuting(job.nodesExecuting())
+                                                               .nodesSucceeded(job.nodesSucceeded())
+                                                               .nodesFailed(job.nodesFailed())
+                                                               .lastUpdate(job.lastUpdate())
+                                                               .build()
+                             )
+                             .forEach(listResponse::addJob);
+                         context.json(listResponse);
+                     });
     }
 }
