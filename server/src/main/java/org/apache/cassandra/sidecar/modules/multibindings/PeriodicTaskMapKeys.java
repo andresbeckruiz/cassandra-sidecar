@@ -38,4 +38,5 @@ public interface PeriodicTaskMapKeys
     interface CdcConfigRefresherNotifierKey extends ClassKey {}
     interface CassandraClusterSchemaTaskKey extends ClassKey {}
     interface UnsupportedSchemaCacheTaskKey extends ClassKey {}
+    interface StorageBackedLocalJobCoordinatorKey extends ClassKey {}
 }
