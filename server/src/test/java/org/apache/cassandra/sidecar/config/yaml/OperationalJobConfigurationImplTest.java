@@ -45,6 +45,19 @@ class OperationalJobConfigurationImplTest
     }
 
     @Test
+    void testEmptyRollingRestartSectionUsesDefaults() throws IOException
+    {
+        String yaml = "operational_job:\n"
+                      + "  rolling_restart:\n";
+
+        OperationalJobConfiguration config = SidecarConfigurationImpl.fromYamlString(yaml)
+                                                                     .operationalJobConfiguration();
+
+        assertThat(config.rollingRestartConfiguration()).isNotNull();
+        assertThat(config.rollingRestartConfiguration().enabled()).isFalse();
+    }
+
+    @Test
     void testEmptyYamlValuesUseDefaults() throws IOException
     {
         String yaml = "operational_job:\n"

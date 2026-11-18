@@ -49,4 +49,9 @@ public interface OperationalJobConfiguration
      * @return the maximum time a node's local job may execute before it is marked failed
      */
     SecondBoundConfiguration nodeExecutionTimeout();
+
+    /**
+     * @return configuration for rolling restart operations
+     */
+    RollingRestartConfiguration rollingRestartConfiguration();
 }
