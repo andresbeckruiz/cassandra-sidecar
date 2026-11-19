@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 
 import org.apache.cassandra.sidecar.config.OperationalJobConfiguration;
 import org.apache.cassandra.sidecar.config.yaml.OperationalJobConfigurationImpl;
+import org.apache.cassandra.sidecar.config.yaml.RollingRestartConfigurationImpl;
 
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
@@ -79,11 +80,36 @@ class CassandraOperationsModuleTest
         config(false, true), true)).doesNotThrowAnyException();
     }
 
+    @Test
+    void passesWhenRollingRestartEnabledWithCoordination()
+    {
+        assertThatCode(() -> CassandraOperationsModule.validateOperationalJobConfiguration(
+        config(true, true, true), true)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void failsWhenRollingRestartEnabledWithoutCoordination()
+    {
+        assertThatIllegalArgumentException()
+        .isThrownBy(() -> CassandraOperationsModule.validateOperationalJobConfiguration(config(false, true, true),
+                                                                                       true));
+    }
+
     private static OperationalJobConfiguration config(boolean coordinationEnabled, boolean durableTrackingEnabled)
+    {
+        return config(coordinationEnabled, durableTrackingEnabled, false);
+    }
+
+    private static OperationalJobConfiguration config(boolean coordinationEnabled,
+                                                      boolean durableTrackingEnabled,
+                                                      boolean rollingRestartEnabled)
     {
         return OperationalJobConfigurationImpl.builder()
                                               .coordinationEnabled(coordinationEnabled)
                                               .durableTrackingEnabled(durableTrackingEnabled)
+                                              .rollingRestartConfiguration(RollingRestartConfigurationImpl.builder()
+                                                                                                          .enabled(rollingRestartEnabled)
+                                                                                                          .build())
                                               .build();
     }
 }

@@ -51,6 +51,7 @@ import org.apache.cassandra.sidecar.common.response.TokenRangeReplicasResponse;
 import org.apache.cassandra.sidecar.common.response.v2.V2NodeSettings;
 import org.apache.cassandra.sidecar.concurrent.ExecutorPools;
 import org.apache.cassandra.sidecar.config.OperationalJobConfiguration;
+import org.apache.cassandra.sidecar.config.RollingRestartConfiguration;
 import org.apache.cassandra.sidecar.config.SchemaKeyspaceConfiguration;
 import org.apache.cassandra.sidecar.config.ServiceConfiguration;
 import org.apache.cassandra.sidecar.config.SidecarConfiguration;
@@ -86,6 +87,9 @@ import org.apache.cassandra.sidecar.job.OperationalJobCoordinator;
 import org.apache.cassandra.sidecar.job.OperationalJobTracker;
 import org.apache.cassandra.sidecar.job.StorageBackedLocalJobCoordinator;
 import org.apache.cassandra.sidecar.job.StorageBackedOperationalJobCoordinator;
+import org.apache.cassandra.sidecar.job.restart.ReplicaScopeHealthChecker;
+import org.apache.cassandra.sidecar.job.restart.RestartLocalJobFactory;
+import org.apache.cassandra.sidecar.job.restart.RingHealthChecker;
 import org.apache.cassandra.sidecar.job.storage.StorageProvider;
 import org.apache.cassandra.sidecar.modules.multibindings.KeyClassMapKey;
 import org.apache.cassandra.sidecar.modules.multibindings.PeriodicTaskMapKeys;
@@ -131,7 +135,9 @@ public class CassandraOperationsModule extends AbstractModule
             warnIfLowReplicationFactor(configuration.operationalJobConfiguration(), schemaConfiguration);
         }
         bind(LocalJobManager.class).in(Singleton.class);
-        MapBinder.newMapBinder(binder(), OperationType.class, LocalJobFactory.class);
+        MapBinder.newMapBinder(binder(), OperationType.class, LocalJobFactory.class)
+                 .addBinding(OperationType.RESTART).to(RestartLocalJobFactory.class);
+        bind(RingHealthChecker.class).to(ReplicaScopeHealthChecker.class).in(Singleton.class);
     }
 
     static void validateOperationalJobConfiguration(OperationalJobConfiguration config, boolean schemaEnabled)
@@ -141,6 +147,13 @@ public class CassandraOperationsModule extends AbstractModule
             throw new IllegalArgumentException(
             "Invalid operational_job configuration: coordination_enabled requires durable_tracking_enabled to be true, "
             + "because the coordinator reads the job records and node statuses stored by durable tracking");
+        }
+
+        if (config.rollingRestartConfiguration().enabled() && !config.coordinationEnabled())
+        {
+            throw new IllegalArgumentException(
+            "Invalid operational_job configuration: rolling_restart.enabled requires coordination_enabled to be true, "
+            + "because each node's restart is run by the local job coordinator");
         }
 
         if (schemaEnabled)
@@ -176,6 +189,13 @@ public class CassandraOperationsModule extends AbstractModule
                         schemaConfiguration.keyspace(), schemaConfiguration.replicationFactor(),
                         MIN_RECOMMENDED_REPLICATION_FACTOR);
         }
+    }
+
+    @Provides
+    @Singleton
+    RollingRestartConfiguration rollingRestartConfiguration(SidecarConfiguration sidecarConfiguration)
+    {
+        return sidecarConfiguration.operationalJobConfiguration().rollingRestartConfiguration();
     }
 
     /**

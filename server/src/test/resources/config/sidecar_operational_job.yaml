@@ -39,3 +39,9 @@ operational_job:
   local_job_coordination_delay: 90s
   node_execution_timeout: 20m
   durable_tracking_enabled: true
+  rolling_restart:
+    enabled: true
+    cassandra_health_timeout: 45s
+    node_state_transition_timeout: 300s
+    node_restart_retry_attempts: 5
+    wait_between_execution_groups: 120s

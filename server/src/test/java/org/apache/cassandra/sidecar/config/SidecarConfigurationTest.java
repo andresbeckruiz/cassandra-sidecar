@@ -146,6 +146,13 @@ class SidecarConfigurationTest
         assertThat(operationalJob.localJobCoordinationDelay()).isEqualTo(SecondBoundConfiguration.parse("90s"));
         assertThat(operationalJob.nodeExecutionTimeout()).isEqualTo(SecondBoundConfiguration.parse("20m"));
         assertThat(operationalJob.durableTrackingEnabled()).isTrue();
+
+        RollingRestartConfiguration rollingRestart = operationalJob.rollingRestartConfiguration();
+        assertThat(rollingRestart.enabled()).isTrue();
+        assertThat(rollingRestart.cassandraHealthTimeout()).isEqualTo(SecondBoundConfiguration.parse("45s"));
+        assertThat(rollingRestart.nodeStateTransitionTimeout()).isEqualTo(SecondBoundConfiguration.parse("300s"));
+        assertThat(rollingRestart.nodeRestartRetryAttempts()).isEqualTo(5);
+        assertThat(rollingRestart.waitBetweenExecutionGroups()).isEqualTo(SecondBoundConfiguration.parse("120s"));
     }
 
     @Test

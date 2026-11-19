@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.sidecar.lifecycle;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.distributed.api.IInstance;
@@ -30,6 +32,7 @@ import org.apache.cassandra.sidecar.cluster.instance.InstanceMetadata;
 public class InJvmDTestLifecycleProvider implements LifecycleProvider
 {
     private final Iterable<? extends IInstance> instances;
+    private final Map<String, IInstance> instancesByHost = new ConcurrentHashMap<>();
 
     public InJvmDTestLifecycleProvider(Iterable<? extends IInstance> instances)
     {
@@ -62,14 +65,34 @@ public class InJvmDTestLifecycleProvider implements LifecycleProvider
         return !getInstance(host).isShutdown();
     }
 
+    /**
+     * Resolves the instance for {@code instanceMetadata}, remembering each host it resolves.
+     *
+     * <p>In Cassandra 4.0, {@link IInstance#broadcastAddress()} is routed through the dtest delegate, which is
+     * discarded when an instance shuts down. Scanning the instances therefore throws once any of them is stopped,
+     * so the remembered hosts are used when the scan fails.</p>
+     */
     private IInstance getInstance(InstanceMetadata instanceMetadata)
     {
-        for (IInstance instance : instances)
+        try
         {
-            if (instance.broadcastAddress().getHostName().equals(instanceMetadata.host()))
+            for (IInstance instance : instances)
             {
-                return instance;
+                if (instance.broadcastAddress().getHostName().equals(instanceMetadata.host()))
+                {
+                    instancesByHost.put(instanceMetadata.host(), instance);
+                    return instance;
+                }
             }
+        }
+        catch (IllegalStateException e)
+        {
+            IInstance known = instancesByHost.get(instanceMetadata.host());
+            if (known != null)
+            {
+                return known;
+            }
+            throw e;
         }
         throw new IllegalArgumentException("No instance found for host: " + instanceMetadata);
     }
